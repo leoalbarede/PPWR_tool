@@ -7,8 +7,6 @@ import shutil
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import tiktoken_cache_setup  # noqa: F401 — stable TIKTOKEN_CACHE_DIR before OpenAI stack
-import flashrank_cache_setup
-from flashrank_cache_setup import get_flashrank_ranker
 
 from langchain_docling import DoclingLoader
 from langchain_docling.loader import ExportType
@@ -30,31 +28,36 @@ VECTOR_CACHE_DIR = os.path.join(BASE_DIR, "vector_cache")
 CHUNKS_PICKLE_NAME = "index_chunks.pkl"
 
 # Bump when chunking, embedding model, index layout, or retrieval stack changes.
-RAG_INDEX_VERSION = "4"
+RAG_INDEX_VERSION = "5"
 # `text-embedding-3-large` améliore le dense retrieval sur du texte ESG riche ; coût plus élevé.
 # Surcharge possible : RAG_EMBEDDING_MODEL=text-embedding-3-small
 _DEFAULT_EMBEDDING = "text-embedding-3-small"
 EMBEDDING_MODEL = (os.getenv("RAG_EMBEDDING_MODEL") or _DEFAULT_EMBEDDING).strip() or _DEFAULT_EMBEDDING
 CHUNK_SIZE = 1600
 CHUNK_OVERLAP = 400
+# Recursive split only when a header section exceeds this (keeps short PPWR letters intact).
+SECTION_SPLIT_THRESHOLD = CHUNK_SIZE + 200
 
-# --- Retrieval (hybride RRF + multi-requêtes + rerank court) ---
-# Plus de poids sur le dense : thématique / reformulations dans les rapports ESG.
+# --- Adaptive retrieval profiles (auto-selected from chunk count) ---
+# small  (≤6 chunks, ~≤5 pp): BM25 only, single query, no rerank, no vector index
+# medium (7–20 chunks, ~6–15 pp): BM25 + dense MMR, single query, no rerank
+# large  (>20 chunks): full hybrid + multi-query + FlashRank (legacy ESG mode)
+PROFILE_SMALL_MAX_CHUNKS = 6
+PROFILE_MEDIUM_MAX_CHUNKS = 20
+
+# Hybrid weights (medium / large dense branch)
 ENSEMBLE_WEIGHTS_BM25_DENSE: Tuple[float, float] = (0.35, 0.65)
 MMR_LAMBDA_MULT = 0.55
+
+# large-profile only (100-page ESG reports)
 BRANCH_K_MIN = 28
 BRANCH_K_FACTOR = 6
 FETCH_K_FACTOR = 2
 FETCH_K_MIN = 48
-# Par sous-requête : tronquer la sortie fusionnée pour limiter latence avant rerank global.
 POOL_TOP_PER_SUBQUERY = 42
-# Documents uniques max passés au cross-encodeur FlashRank.
 MAX_MERGED_BEFORE_RERANK = 78
-# Requête FlashRank : rester sous ~512 tokens utiles pour le CE.
 RERANK_QUERY_MAX_CHARS = 1500
-# Première sous-requête : titre + checklist (sans l’instruction LLM longue).
 SECTION_BODY_MAX_CHARS = 2600
-# Lignes numérotées supplémentaires (1 requête courte par ligne).
 MAX_NUMBERED_SUBQUERIES = 8
 
 if not os.path.exists(MARKDOWN_CACHE_DIR):
@@ -146,7 +149,7 @@ def _split_documents(documents: List[Document]) -> List[Document]:
     final: List[Document] = []
     for doc in header_chunks:
         doc.metadata.setdefault("source", source)
-        if len(doc.page_content) > CHUNK_SIZE + 200:
+        if len(doc.page_content) > SECTION_SPLIT_THRESHOLD:
             final.extend(recursive.split_documents([doc]))
         else:
             final.append(doc)
@@ -203,7 +206,7 @@ def _expected_index_meta(pdf_hash: str, num_chunks: int) -> dict:
         "chunk_overlap": CHUNK_OVERLAP,
         "chunk_strategy": "markdown_headers_plus_recursive",
         "chunk_count": num_chunks,
-        "retrieval": "hybrid_rrf_mmr_flashrank_multiq_short_rerank_v4",
+        "retrieval": "adaptive_small_medium_large_v5",
     }
 
 
@@ -262,21 +265,29 @@ def _dedupe_docs_preserve_order(docs: Iterable[Document]) -> List[Document]:
     return out
 
 
-def _retrieval_subqueries(section_title: str, points_body: str) -> List[str]:
-    """
-    Requêtes courtes pour BM25 + dense (pas l’instruction LLM complète).
-    - Une requête « checklist » tronquée.
-    - Une requête par ligne numérotée (alignée au cross-encodeur / lexique).
-    """
+def _select_retrieval_profile(n_chunks: int) -> str:
+    if n_chunks <= PROFILE_SMALL_MAX_CHUNKS:
+        return "small"
+    if n_chunks <= PROFILE_MEDIUM_MAX_CHUNKS:
+        return "medium"
+    return "large"
+
+
+def _section_retrieval_query(section_title: str, points_body: str) -> str:
     title = (section_title or "").strip()
     body = (points_body or "").strip()
-    queries: List[str] = [f"{title}\n{body[:SECTION_BODY_MAX_CHARS]}".strip()]
+    return f"{title}\n{body[:SECTION_BODY_MAX_CHARS]}".strip()
+
+
+def _retrieval_subqueries(section_title: str, points_body: str) -> List[str]:
+    """Multi-query expansion — large documents only."""
+    queries = [_section_retrieval_query(section_title, points_body)]
     numbered = 0
-    for line in body.splitlines():
+    for line in (points_body or "").splitlines():
         line = line.strip()
         if not line or not re.match(r"^\d+\.\s", line):
             continue
-        queries.append(f"{title}\n{line}")
+        queries.append(f"{(section_title or '').strip()}\n{line}")
         numbered += 1
         if numbered >= MAX_NUMBERED_SUBQUERIES:
             break
@@ -288,27 +299,36 @@ def _rerank_query_short(section_title: str, points_body: str) -> str:
     return f"{(section_title or '').strip()}\n{body[:RERANK_QUERY_MAX_CHARS]}".strip()
 
 
+def _k_eff(k: int, n: int) -> int:
+    return min(max(k, 1), n)
+
+
+def _build_bm25_retriever(chunks: List[Document], branch_k: int) -> BM25Retriever:
+    retriever = BM25Retriever.from_documents(chunks)
+    retriever.k = branch_k
+    return retriever
+
+
 def _build_ensemble_retriever(
     vectorstore: Chroma,
     chunks: List[Document],
     k: int,
+    *,
+    large_mode: bool = False,
 ) -> Tuple[EnsembleRetriever, int, int, int]:
-    """
-    BM25 + MMR dense, fusion RRF (sans FlashRank — le rerank est appliqué ensuite
-    sur le pool fusionné multi-requêtes).
-    Retourne (ensemble, k_eff, branch_k, fetch_k).
-    """
     n = len(chunks)
     if n == 0:
         raise ValueError("No text chunks to index.")
 
-    k_eff = min(max(k, 1), n)
-    branch_k = min(max(k_eff * BRANCH_K_FACTOR, BRANCH_K_MIN), n)
-    fetch_k = min(max(branch_k * FETCH_K_FACTOR, FETCH_K_MIN), n)
+    k_eff = _k_eff(k, n)
+    if large_mode:
+        branch_k = min(max(k_eff * BRANCH_K_FACTOR, BRANCH_K_MIN), n)
+        fetch_k = min(max(branch_k * FETCH_K_FACTOR, FETCH_K_MIN), n)
+    else:
+        branch_k = min(n, max(k_eff * 2, k_eff + 2))
+        fetch_k = min(n, branch_k * 2)
 
-    bm25_retriever = BM25Retriever.from_documents(chunks)
-    bm25_retriever.k = branch_k
-
+    bm25_retriever = _build_bm25_retriever(chunks, branch_k)
     dense_retriever = vectorstore.as_retriever(
         search_type="mmr",
         search_kwargs={
@@ -317,7 +337,6 @@ def _build_ensemble_retriever(
             "lambda_mult": MMR_LAMBDA_MULT,
         },
     )
-
     w_bm25, w_dense = ENSEMBLE_WEIGHTS_BM25_DENSE
     ensemble = EnsembleRetriever(
         retrievers=[bm25_retriever, dense_retriever],
@@ -326,13 +345,48 @@ def _build_ensemble_retriever(
     return ensemble, k_eff, branch_k, fetch_k
 
 
-def _retrieve_merge_rerank(
+def _truncate_to_k(docs: List[Document], k: int) -> List[Document]:
+    return _dedupe_docs_preserve_order(docs)[:k]
+
+
+def _retrieve_small(
+    chunks: List[Document],
+    k: int,
+    section_title: str,
+    points_body: str,
+) -> Tuple[List[Document], List[str], str]:
+    query = _section_retrieval_query(section_title, points_body)
+    k_eff = _k_eff(k, len(chunks))
+    if len(chunks) <= k_eff:
+        return list(chunks), [query], query
+    bm25 = _build_bm25_retriever(chunks, k_eff)
+    return _truncate_to_k(bm25.invoke(query), k_eff), [query], query
+
+
+def _retrieve_medium(
+    vectorstore: Chroma,
+    chunks: List[Document],
+    k: int,
+    section_title: str,
+    points_body: str,
+) -> Tuple[List[Document], List[str], str]:
+    query = _section_retrieval_query(section_title, points_body)
+    ensemble, k_eff, _, _ = _build_ensemble_retriever(
+        vectorstore, chunks, k, large_mode=False
+    )
+    return _truncate_to_k(ensemble.invoke(query), k_eff), [query], query
+
+
+def _retrieve_large(
     ensemble: EnsembleRetriever,
     reranker: FlashrankRerank,
+    k: int,
+    n_chunks: int,
     section_title: str,
     points_body: str,
 ) -> Tuple[List[Document], List[str], str]:
     subqs = _retrieval_subqueries(section_title, points_body)
+    k_eff = _k_eff(k, n_chunks)
     merged: List[Document] = []
     for sq in subqs:
         ranked = ensemble.invoke(sq)
@@ -345,17 +399,51 @@ def _retrieve_merge_rerank(
     rerank_q = _rerank_query_short(section_title, points_body)
     if not merged:
         return [], subqs, rerank_q
+    reranker.top_n = k_eff
     final = list(reranker.compress_documents(merged, rerank_q))
     return final, subqs, rerank_q
 
 
-def _prepare_index(pdf_path: str, api_key: str) -> Tuple[Chroma, str, List[Document]]:
+def _retrieve_for_section(
+    profile: str,
+    chunks: List[Document],
+    k: int,
+    section_title: str,
+    points_body: str,
+    vectorstore: Optional[Chroma] = None,
+    ensemble: Optional[EnsembleRetriever] = None,
+    reranker: Optional[FlashrankRerank] = None,
+) -> Tuple[List[Document], List[str], str]:
+    if profile == "small":
+        return _retrieve_small(chunks, k, section_title, points_body)
+    if profile == "medium":
+        if vectorstore is None:
+            raise ValueError("vectorstore required for medium profile")
+        return _retrieve_medium(vectorstore, chunks, k, section_title, points_body)
+    if ensemble is None or reranker is None:
+        raise ValueError("ensemble and reranker required for large profile")
+    return _retrieve_large(
+        ensemble, reranker, k, len(chunks), section_title, points_body
+    )
+
+
+def _prepare_index(
+    pdf_path: str,
+    api_key: str,
+) -> Tuple[Optional[Chroma], str, List[Document], str]:
     pdf_hash = _sha256_file(pdf_path)
     doc = _load_markdown_document(pdf_path)
     chunks = _split_documents([doc])
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, openai_api_key=api_key)
-    vectorstore, chunks_out = _get_or_build_vectorstore(chunks, embeddings, pdf_hash)
-    return vectorstore, pdf_hash, chunks_out
+    profile = _select_retrieval_profile(len(chunks))
+    print(f"📊 Profil retrieval : {profile} ({len(chunks)} chunk(s))")
+
+    vectorstore: Optional[Chroma] = None
+    if profile in ("medium", "large"):
+        embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, openai_api_key=api_key)
+        vectorstore, chunks_out = _get_or_build_vectorstore(chunks, embeddings, pdf_hash)
+        return vectorstore, pdf_hash, chunks_out, profile
+
+    return None, pdf_hash, chunks, profile
 
 
 @observe
@@ -364,19 +452,19 @@ def ask_pdf_multi_section(
     instruction: str,
     sections: List[Tuple[str, str]],
     api_key: str,
-    k: int = 10,
+    k: int = 5,
     return_retrieval_debug: bool = False,
+    retrieval_profile: Optional[str] = None,
 ) -> dict:
     """
     Plusieurs passes retrieval (une par bloc thématique) sur le même index.
+
+    Profil auto (selon le nombre de chunks) :
+    - small  : BM25 seul, pas d'index vectoriel ni FlashRank
+    - medium : BM25 + dense MMR, pas de FlashRank
+    - large  : hybride + multi-requêtes + FlashRank (rapports longs)
+
     sections: liste de (titre_section, texte_points_numérotés).
-
-    Retrieval : sous-requêtes courtes (checklist + une par ligne numérotée), fusion
-    des pools RRF, puis rerank FlashRank sur une requête courte. Le LLM reçoit la
-    question complète (instruction + section + points) avec uniquement ces chunks.
-
-    Si return_retrieval_debug=True, la clé retrieval_debug contient, par section,
-    les documents finaux (post rerank) et les requêtes utilisées.
     """
     if not sections:
         out: Dict[str, Any] = {"answer": "", "source_file": os.path.basename(pdf_path)}
@@ -384,16 +472,35 @@ def ask_pdf_multi_section(
             out["retrieval_debug"] = []
         return out
 
-    vectorstore, _pdf_hash, chunks = _prepare_index(pdf_path, api_key)
+    vectorstore, _pdf_hash, chunks, auto_profile = _prepare_index(pdf_path, api_key)
+    profile = retrieval_profile or auto_profile
+    if profile not in ("small", "medium", "large"):
+        raise ValueError(f"Invalid retrieval_profile: {profile}")
+
     llm = ChatOpenAI(
         model_name="gpt-4o-mini",
         temperature=0,
         openai_api_key=api_key,
         max_tokens=2500,
     )
-    ensemble, k_eff, _branch_k, _fetch_k = _build_ensemble_retriever(vectorstore, chunks, k)
-    reranker = FlashrankRerank(top_n=k_eff, client=get_flashrank_ranker())
     combine = load_qa_chain(llm, chain_type="stuff")
+
+    ensemble: Optional[EnsembleRetriever] = None
+    reranker: Optional[FlashrankRerank] = None
+    k_eff = _k_eff(k, len(chunks))
+
+    if profile == "large":
+        if vectorstore is None:
+            embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, openai_api_key=api_key)
+            vectorstore, chunks = _get_or_build_vectorstore(
+                chunks, embeddings, _sha256_file(pdf_path)
+            )
+        ensemble, k_eff, _, _ = _build_ensemble_retriever(
+            vectorstore, chunks, k, large_mode=True
+        )
+        from flashrank_cache_setup import get_flashrank_ranker
+
+        reranker = FlashrankRerank(top_n=k_eff, client=get_flashrank_ranker())
 
     blocks: List[str] = []
     retrieval_rows: List[Dict[str, Any]] = []
@@ -406,8 +513,15 @@ def ask_pdf_multi_section(
             f"Keep the same line format for each point.\n\n"
             f"POINTS TO VERIFY:\n{points_stripped}\n"
         )
-        source_docs, subqs, rerank_q = _retrieve_merge_rerank(
-            ensemble, reranker, title, points_stripped
+        source_docs, subqs, rerank_q = _retrieve_for_section(
+            profile,
+            chunks,
+            k,
+            title,
+            points_stripped,
+            vectorstore=vectorstore,
+            ensemble=ensemble,
+            reranker=reranker,
         )
         pool_empty = not source_docs
         if pool_empty:
@@ -431,6 +545,7 @@ def ask_pdf_multi_section(
             retrieval_rows.append(
                 {
                     "section_title": title,
+                    "retrieval_profile": profile,
                     "query": query_llm,
                     "llm_query": query_llm,
                     "retrieval_subqueries": subqs,
@@ -444,6 +559,8 @@ def ask_pdf_multi_section(
     result: Dict[str, Any] = {
         "answer": "\n\n".join(blocks),
         "source_file": os.path.basename(pdf_path),
+        "retrieval_profile": profile,
+        "n_index_chunks": len(chunks),
     }
     if return_retrieval_debug:
         result["retrieval_debug"] = retrieval_rows

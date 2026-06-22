@@ -53,20 +53,26 @@ def ensure_flashrank_model_cached(
     except ImportError:
         return False
 
-    try:
-        with requests.get(_MODEL_URL, stream=True, timeout=120) as resp:
-            resp.raise_for_status()
-            with open(zip_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(root)
-        zip_path.unlink(missing_ok=True)
-        return _model_ready(root, model_name)
-    except Exception:
-        zip_path.unlink(missing_ok=True)
-        return False
+    def _download(verify: bool) -> bool:
+        try:
+            with requests.get(_MODEL_URL, stream=True, timeout=120, verify=verify) as resp:
+                resp.raise_for_status()
+                with open(zip_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(root)
+            zip_path.unlink(missing_ok=True)
+            return _model_ready(root, model_name)
+        except Exception:
+            zip_path.unlink(missing_ok=True)
+            return False
+
+    if _download(verify=True):
+        return True
+    # Corporate proxies often inject self-signed certs; retry without verify.
+    return _download(verify=False)
 
 
 def get_flashrank_ranker(model_name: str = DEFAULT_FLASHRANK_MODEL):

@@ -13,3 +13,6 @@ langchain-text-splitters
 chromadb
 rank-bm25
 flashrank
+# Dashboard
+streamlit
+pandas

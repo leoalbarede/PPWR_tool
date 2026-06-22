@@ -64,13 +64,20 @@ def _try_download(cache_path: Path) -> bool:
         import requests
     except ImportError:
         return False
-    try:
-        resp = requests.get(_CL100K_BLOB, timeout=60)
-        resp.raise_for_status()
-        data = resp.content
-    except Exception:
-        return False
-    if not _hash_ok(data):
+
+    def _fetch(verify: bool) -> Optional[bytes]:
+        try:
+            resp = requests.get(_CL100K_BLOB, timeout=60, verify=verify)
+            resp.raise_for_status()
+            return resp.content
+        except Exception:
+            return None
+
+    data = _fetch(verify=True)
+    if data is None:
+        # Corporate proxies often inject self-signed certs; retry without verify.
+        data = _fetch(verify=False)
+    if data is None or not _hash_ok(data):
         return False
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_bytes(data)
