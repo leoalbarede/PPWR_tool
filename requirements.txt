@@ -1,0 +1,15 @@
+python-dotenv
+tiktoken
+rapidfuzz
+langfuse
+# RAG core (analyzer_docling)
+langchain
+langchain-classic
+langchain-core
+langchain-community
+langchain-openai
+langchain-docling
+langchain-text-splitters
+chromadb
+rank-bm25
+flashrank

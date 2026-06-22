@@ -1,0 +1,8 @@
+.env
+.DS_Store
+markdown_cache/
+vector_cache/
+tiktoken_cache/
+flashrank_cache/
+__pycache__/
+*.pyc
