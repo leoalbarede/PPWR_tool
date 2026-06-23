@@ -1,0 +1,15 @@
+# Full local audit pipeline (PDF RAG + CSV export). Not required for Streamlit Cloud dashboard.
+python-dotenv
+tiktoken
+rapidfuzz
+langfuse
+langchain
+langchain-classic
+langchain-core
+langchain-community
+langchain-openai
+langchain-docling
+langchain-text-splitters
+chromadb
+rank-bm25
+flashrank

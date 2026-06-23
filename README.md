@@ -18,7 +18,15 @@ Caches are created automatically under `markdown_cache/`, `vector_cache/`, `tikt
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+pip install -r requirements-audit.txt
+pip install streamlit pandas
+```
+
+For **local dashboard only** (no PDF audit):
+
+```bash
 pip install -r requirements.txt
+streamlit run streamlit_app.py
 ```
 
 Create a `.env` file:
@@ -63,8 +71,30 @@ python ppwr_audit.py --supplier "CONSTANTIA"
 python ppwr_audit.py --with-evidence-columns
 
 # Dashboard (after audit CSV exists)
-streamlit run dashboard_ppwr.py
+streamlit run streamlit_app.py
 ```
+
+## Streamlit Cloud deployment
+
+The hosted app only needs **`streamlit_app.py`**, **`dashboard_ppwr.py`**, **`evidence_validator.py`**, and **`ppwr_audit_results.csv`**. The heavy RAG stack (`requirements-audit.txt`) runs locally.
+
+1. Generate or update results locally:
+
+```bash
+pip install -r requirements-audit.txt
+python ppwr_audit.py --with-evidence-columns
+```
+
+2. Commit and push `ppwr_audit_results.csv` with the code.
+
+3. On [share.streamlit.io](https://share.streamlit.io), create an app from **`leoalbarede/PPWR_tool`**:
+   - **Main file:** `streamlit_app.py`
+   - **Python:** 3.11 (see `.python-version`)
+   - **Requirements:** `requirements.txt` (auto-detected)
+
+4. Redeploy after each CSV update (push to `main`).
+
+No Streamlit secrets are required for the dashboard (read-only CSV).
 
 **CSV columns (default):**
 

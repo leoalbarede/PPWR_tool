@@ -60,6 +60,20 @@ RERANK_QUERY_MAX_CHARS = 1500
 SECTION_BODY_MAX_CHARS = 2600
 MAX_NUMBERED_SUBQUERIES = 8
 
+# Focused BM25 queries for second pass when a section returns N/A.
+NA_RETRY_QUERIES: Dict[str, List[str]] = {
+    "heavy metals": [
+        "lead cadmium mercury hexavalent chromium 100 ppm mg/kg packaging material",
+        "Pb Cd Hg Cr6 sum concentration does not exceed compliant",
+        "heavy metals packaging components limit declaration",
+    ],
+    "soc": [
+        "substances of concern SVHC packaging material concentration detected",
+        "SoC substances of concern absent not detected packaging components",
+        "REACH SVHC candidate list packaging material 0.1%",
+    ],
+}
+
 if not os.path.exists(MARKDOWN_CACHE_DIR):
     os.makedirs(MARKDOWN_CACHE_DIR)
 if not os.path.exists(VECTOR_CACHE_DIR):
@@ -446,6 +460,62 @@ def _prepare_index(
     return None, pdf_hash, chunks, profile
 
 
+def get_document_markdown(pdf_path: str) -> str:
+    """Full markdown text (from cache or Docling) for evidence validation."""
+    return _load_markdown_document(pdf_path).page_content
+
+
+def _na_retry_queries_for(section_title: str) -> List[str]:
+    title = (section_title or "").lower()
+    if "heavy metal" in title or "pb" in title:
+        return NA_RETRY_QUERIES["heavy metals"]
+    if "soc" in title or "substances of concern" in title:
+        return NA_RETRY_QUERIES["soc"]
+    return []
+
+
+def _section_answer_is_na(answer_text: str) -> bool:
+    m = re.search(r"Answer:\s*(YES|NO|N/A)\b", answer_text or "", re.IGNORECASE)
+    return bool(m and m.group(1).upper() == "N/A")
+
+
+def _retrieve_by_queries(
+    profile: str,
+    chunks: List[Document],
+    k: int,
+    queries: List[str],
+    vectorstore: Optional[Chroma] = None,
+    ensemble: Optional[EnsembleRetriever] = None,
+) -> List[Document]:
+    """Merge BM25 / ensemble hits for multiple short retry queries."""
+    if not queries or not chunks:
+        return []
+    k_pool = min(len(chunks), max(_k_eff(k, len(chunks)) * 2, _k_eff(k, len(chunks)) + 3))
+    merged: List[Document] = []
+
+    if profile == "small":
+        bm25 = _build_bm25_retriever(chunks, min(len(chunks), k_pool * 2))
+        for q in queries:
+            for doc in bm25.invoke(q):
+                merged.append(doc)
+            merged = _dedupe_docs_preserve_order(merged)
+    elif profile == "medium" and vectorstore is not None:
+        ensemble, branch_k, _, _ = _build_ensemble_retriever(
+            vectorstore, chunks, k, large_mode=False
+        )
+        for q in queries:
+            for doc in ensemble.invoke(q)[:branch_k]:
+                merged.append(doc)
+            merged = _dedupe_docs_preserve_order(merged)
+    elif profile == "large" and ensemble is not None:
+        for q in queries:
+            for doc in ensemble.invoke(q)[:POOL_TOP_PER_SUBQUERY]:
+                merged.append(doc)
+            merged = _dedupe_docs_preserve_order(merged)
+
+    return merged[:k_pool]
+
+
 @observe
 def ask_pdf_multi_section(
     pdf_path: str,
@@ -455,6 +525,7 @@ def ask_pdf_multi_section(
     k: int = 5,
     return_retrieval_debug: bool = False,
     retrieval_profile: Optional[str] = None,
+    retry_na_sections: bool = False,
 ) -> dict:
     """
     Plusieurs passes retrieval (une par bloc thématique) sur le même index.
@@ -465,6 +536,7 @@ def ask_pdf_multi_section(
     - large  : hybride + multi-requêtes + FlashRank (rapports longs)
 
     sections: liste de (titre_section, texte_points_numérotés).
+    retry_na_sections: seconde passe retrieval ciblée si Answer: N/A.
     """
     if not sections:
         out: Dict[str, Any] = {"answer": "", "source_file": os.path.basename(pdf_path)}
@@ -510,9 +582,20 @@ def ask_pdf_multi_section(
             f"{instruction}\n\n"
             f"SECTION: {title}\n"
             f"Answer ONLY for the numbered points in this section. "
-            f"Keep the same line format for each point.\n\n"
-            f"POINTS TO VERIFY:\n{points_stripped}\n"
+            f"Keep the same line format for each point.\n"
         )
+        title_lower = title.lower()
+        if "soc" in title_lower or "substances of concern" in title_lower:
+            query_llm += (
+                "IMPORTANT: Evidence for SoC must mention Substances of Concern, SVHC, or CMR. "
+                "Do NOT reuse quotes about Pb/Cd/Hg/Cr6+/heavy metals. Use N/A if only heavy metals are discussed.\n\n"
+            )
+        elif "heavy metal" in title_lower or "pb, cd" in title_lower:
+            query_llm += (
+                "IMPORTANT: Evidence for heavy metals must mention Pb, Cd, Hg, Cr6+, or heavy metals. "
+                "Do NOT reuse SoC/SVHC quotes unless they explicitly state metal limits.\n\n"
+            )
+        query_llm += f"POINTS TO VERIFY:\n{points_stripped}\n"
         source_docs, subqs, rerank_q = _retrieve_for_section(
             profile,
             chunks,
@@ -539,6 +622,33 @@ def ask_pdf_multi_section(
             {"input_documents": source_docs, "question": query_llm}
         )
         answer = (qa_out.get("output_text") or "").strip()
+        retried = False
+
+        if retry_na_sections and _section_answer_is_na(answer):
+            retry_qs = _na_retry_queries_for(title)
+            if retry_qs:
+                retry_docs = _retrieve_by_queries(
+                    profile,
+                    chunks,
+                    k,
+                    retry_qs,
+                    vectorstore=vectorstore,
+                    ensemble=ensemble,
+                )
+                if retry_docs:
+                    merged = _dedupe_docs_preserve_order(source_docs + retry_docs)
+                    if pool_empty:
+                        merged = retry_docs
+                    merged = merged[: max(k_eff * 2, k_eff)]
+                    print(f"  ↻ Retry retrieval (section was N/A): {title}")
+                    qa_out = combine.invoke(
+                        {"input_documents": merged, "question": query_llm}
+                    )
+                    answer = (qa_out.get("output_text") or "").strip()
+                    source_docs = merged
+                    pool_empty = False
+                    retried = True
+
         blocks.append(f"=== {title} ===\n{answer}")
         if return_retrieval_debug:
             debug_docs = [] if pool_empty else source_docs
@@ -546,6 +656,7 @@ def ask_pdf_multi_section(
                 {
                     "section_title": title,
                     "retrieval_profile": profile,
+                    "retrieval_retried": retried,
                     "query": query_llm,
                     "llm_query": query_llm,
                     "retrieval_subqueries": subqs,

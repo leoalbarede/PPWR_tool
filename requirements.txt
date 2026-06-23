@@ -1,18 +1,3 @@
-python-dotenv
-tiktoken
-rapidfuzz
-langfuse
-# RAG core (analyzer_docling)
-langchain
-langchain-classic
-langchain-core
-langchain-community
-langchain-openai
-langchain-docling
-langchain-text-splitters
-chromadb
-rank-bm25
-flashrank
-# Dashboard
-streamlit
-pandas
+# Streamlit Cloud dashboard (lightweight — reads ppwr_audit_results.csv only)
+streamlit>=1.32,<2
+pandas>=2.0,<3

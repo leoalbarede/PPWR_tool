@@ -11,15 +11,28 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
 
+from evidence_validator import (
+    evidence_matches_check,
+    is_regulatory_boilerplate_only,
+    soc_evidence_duplicates_heavy_metals,
+)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULT_PATH = os.path.join(BASE_DIR, "ppwr_audit_results.csv")
+IS_STREAMLIT_CLOUD = bool(os.getenv("STREAMLIT_SHARING_MODE") or os.getenv("STREAMLIT_SERVER_HEADLESS"))
 
 CHECK_ORDER = ["Heavy metals", "SoC"]
+
+CHECK_DISPLAY: Dict[str, str] = {
+    "Heavy metals": "Heavy metals compliance",
+    "SoC": "SoC compliance",
+}
 
 COL_HEAVY_METALS = "PPWR compliant with heavy metals concentration limit"
 COL_SOC = "PPWR SoC content"
@@ -31,9 +44,31 @@ CHECK_TO_COLUMN: Dict[str, str] = {
 }
 
 _EVIDENCE_IN_CONC_RE = re.compile(
-    r'(?P<topic>Heavy metals|SoC)\s*(?::\s*(?P<conc>[^[]*))?\s*\[(?P<doc>[^:]+):\s*"(?P<quote>[^"]*)"\]',
+    r'(?P<topic>Heavy metals|SoC)\s*(?:'
+    r':\s*(?P<conc>.*?)\s*)?'
+    r'\[(?P<doc>[^:]+):\s*"(?P<quote>[^"]*)"\]',
     re.IGNORECASE,
 )
+
+
+def evidence_ok(evidence: str) -> bool:
+    return (evidence or "").strip() not in ("", "—", "NONE", "nan")
+
+
+def enforce_evidence(raw_answer: str, evidence: str, check: str | None = None) -> str:
+    """Yes/No without valid evidence for this check → N/A."""
+    norm = normalize_answer(raw_answer)
+    if norm not in ("yes", "no"):
+        return norm
+    if not evidence_ok(evidence):
+        return "N/A"
+    if is_regulatory_boilerplate_only(evidence):
+        return "N/A"
+    if check == "Heavy metals" and not evidence_matches_check(evidence, "heavy_metals"):
+        return "N/A"
+    if check == "SoC" and not evidence_matches_check(evidence, "soc"):
+        return "N/A"
+    return norm
 
 
 def normalize_answer(value) -> str:
@@ -56,17 +91,54 @@ def display_answer(value) -> str:
     return "N/A"
 
 
-def summary_count(check: str, answers: pd.Series) -> Tuple[int, int]:
-    """Return (positive_count, total) for summary metrics."""
-    norm = answers.map(normalize_answer)
-    total = len(norm)
+def display_answer_for_check(check: str, value) -> str:
+    """Map raw CSV answers to compliance display (SoC is inverted: yes in CSV = present)."""
+    norm = normalize_answer(value)
+    if check == "SoC":
+        if norm == "no":
+            return "Yes"  # absent / not detected → compliant
+        if norm == "yes":
+            return "No"  # present → non-compliant
+        return "N/A"
+    return display_answer(value)
+
+
+def is_non_compliant(check: str, raw_answer: str) -> bool:
+    """Non-compliant from raw CSV: Heavy metals No, SoC Yes (SoC present)."""
+    norm = normalize_answer(raw_answer)
     if check == "Heavy metals":
-        return int((norm == "yes").sum()), total
-    # SoC: count suppliers with an explicit declaration (yes or no)
-    return int(norm.isin(["yes", "no"]).sum()), total
+        return norm == "no"
+    if check == "SoC":
+        return norm == "yes"
+    return False
 
 
-def _parse_concentration_field(text: str) -> Dict[str, Dict[str, str]]:
+def format_concentration(concentration: str, raw_answer: str, check: str) -> str:
+    if not is_non_compliant(check, raw_answer):
+        return "—"
+    conc = (concentration or "").strip()
+    if not conc or conc in ("N/A", "—"):
+        return "—"
+    return conc
+
+
+def matrix_cell_value(
+    answer_display: str, raw_answer: str, check: str, concentration: str
+) -> str:
+    if is_non_compliant(check, raw_answer):
+        conc = format_concentration(concentration, raw_answer, check)
+        if conc != "—":
+            return f"{answer_display}\n{conc}"
+    return answer_display
+
+
+def summary_count(displays: pd.Series) -> Tuple[int, int]:
+    """Return (compliant Yes count, total)."""
+    total = len(displays)
+    return int((displays == "Yes").sum()), total
+
+
+def _parse_concentration_field(text: str, check: str | None = None) -> Dict[str, Dict[str, str]]:
     """Extract evidence from Concentration column when dedicated columns are absent."""
     out: Dict[str, Dict[str, str]] = {}
     if not text or pd.isna(text):
@@ -74,6 +146,8 @@ def _parse_concentration_field(text: str) -> Dict[str, Dict[str, str]]:
     for m in _EVIDENCE_IN_CONC_RE.finditer(str(text)):
         topic = m.group("topic")
         key = "Heavy metals" if topic.lower().startswith("heavy") else "SoC"
+        if check is not None and key != check:
+            continue
         out[key] = {
             "concentration": (m.group("conc") or "").strip() or "N/A",
             "evidence": m.group("quote").strip(),
@@ -84,7 +158,7 @@ def _parse_concentration_field(text: str) -> Dict[str, Dict[str, str]]:
 
 def _row_evidence(row: pd.Series, check: str) -> Tuple[str, str, str]:
     """Return (concentration, evidence, source_document) for a check."""
-    parsed = _parse_concentration_field(row.get(COL_CONCENTRATION, ""))
+    parsed = _parse_concentration_field(row.get(COL_CONCENTRATION, ""), check=check)
 
     if check == "Heavy metals":
         ev_col, doc_col = "Heavy metals evidence", "Heavy metals source document"
@@ -109,11 +183,52 @@ def _row_evidence(row: pd.Series, check: str) -> Tuple[str, str, str]:
         for part in conc_raw.split(";"):
             part = part.strip()
             if part.lower().startswith(prefix.lower()):
-                # Strip trailing [doc: "quote"] if present
                 concentration = re.sub(r"\s*\[.*\]\s*$", "", part[len(prefix) :]).strip() or "N/A"
                 break
 
     return concentration, evidence or "—", source or "—"
+
+
+@dataclass
+class CheckResult:
+    answer: str
+    answer_display: str
+    concentration: str
+    concentration_display: str
+    evidence: str
+    source_document: str
+    matrix_cell: str
+
+
+def resolve_check(row: pd.Series, check: str) -> CheckResult:
+    """Single source of truth for matrix, detail, and summary (always consistent)."""
+    col = CHECK_TO_COLUMN[check]
+    concentration, evidence, source = _row_evidence(row, check)
+    answer = enforce_evidence(row.get(col), evidence, check=check)
+    if (
+        check == "SoC"
+        and answer in ("yes", "no")
+        and evidence_ok(evidence)
+        and "Heavy metals evidence" in row.index
+    ):
+        hm_evidence = str(row.get("Heavy metals evidence", "") or "").strip()
+        if soc_evidence_duplicates_heavy_metals(hm_evidence, evidence):
+            answer = "N/A"
+            evidence = ""
+    answer_display = display_answer_for_check(check, answer)
+    conc_display = format_concentration(concentration, answer, check)
+    matrix_cell = matrix_cell_value(answer_display, answer, check, concentration)
+    ev_out = evidence if evidence_ok(evidence) else "—"
+    src_out = source if evidence_ok(evidence) else "—"
+    return CheckResult(
+        answer=answer,
+        answer_display=answer_display,
+        concentration=concentration,
+        concentration_display=conc_display,
+        evidence=ev_out,
+        source_document=src_out,
+        matrix_cell=matrix_cell,
+    )
 
 
 def build_detail_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -122,42 +237,36 @@ def build_detail_rows(df: pd.DataFrame) -> pd.DataFrame:
         supplier_no = str(row.get("Supplier No.", "")).strip()
         supplier = str(row.get("Supplier", "")).strip() or supplier_no
         for check in CHECK_ORDER:
-            col = CHECK_TO_COLUMN[check]
-            answer = normalize_answer(row.get(col))
-            concentration, evidence, source = _row_evidence(row, check)
+            result = resolve_check(row, check)
             rows.append(
                 {
                     "Supplier No.": supplier_no,
                     "Supplier": supplier,
-                    "Check": check,
-                    "Answer": answer,
-                    "Answer_display": display_answer(row.get(col)),
-                    "Concentration": concentration,
-                    "Evidence": evidence,
-                    "Source document": source,
+                    "Check": CHECK_DISPLAY[check],
+                    "Check_key": check,
+                    "Answer": result.answer,
+                    "Answer_display": result.answer_display,
+                    "Matrix_cell": result.matrix_cell,
+                    "Concentration": result.concentration,
+                    "Concentration_display": result.concentration_display,
+                    "Evidence": result.evidence,
+                    "Source document": result.source_document,
                 }
             )
     return pd.DataFrame(rows)
 
 
-def _matrix_cell_style(check: str, display_value: str) -> str:
-    v = str(display_value).strip()
+def _matrix_cell_style(check_key: str, display_value: str) -> str:
+    v = str(display_value).strip().split("\n")[0]
     if v == "N/A":
         return "background-color: #e2e3e5; color: #383d41"
-    if check == "Heavy metals":
-        if v == "Yes":
-            return "background-color: #d4edda; color: #155724"
-        return "background-color: #f8d7da; color: #721c24"
-    # SoC: Yes = declared present, No = absent / not detected
     if v == "Yes":
-        return "background-color: #fff3cd; color: #856404"
-    if v == "No":
         return "background-color: #d4edda; color: #155724"
-    return ""
+    return "background-color: #f8d7da; color: #721c24"
 
 
 @st.cache_data
-def load_results(path: str) -> pd.DataFrame:
+def load_results(path: str, mtime: float) -> pd.DataFrame:
     return pd.read_csv(path, encoding="utf-8-sig")
 
 
@@ -173,14 +282,23 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    st.title("Supplier packaging declarations vs. PPWR requirements (regulatory PDFs)")
+    st.title("Supplier packaging declarations vs. PPWR requirements")
 
     if not os.path.isfile(RESULT_PATH):
-        st.error(f"Results file not found:\n`{RESULT_PATH}`")
-        st.info("Run **`python ppwr_audit.py`** to generate **ppwr_audit_results.csv** from the PDFs in `docs/`.")
+        st.error("Results file not found: `ppwr_audit_results.csv`")
+        if IS_STREAMLIT_CLOUD:
+            st.info(
+                "Commit **ppwr_audit_results.csv** to the repository after running "
+                "`python ppwr_audit.py --with-evidence-columns` locally, then redeploy."
+            )
+        else:
+            st.info(
+                "Run **`python ppwr_audit.py --with-evidence-columns`** to generate "
+                "**ppwr_audit_results.csv** from the PDFs in `docs/`."
+            )
         return
 
-    df = load_results(RESULT_PATH)
+    df = load_results(RESULT_PATH, os.path.getmtime(RESULT_PATH))
     if df.empty:
         st.warning("The CSV file has no rows.")
         return
@@ -195,51 +313,52 @@ def main() -> None:
 
     st.info(
         "**PPWR checks** — Each supplier is assessed on two binary points from regulatory PDFs:\n\n"
-        "- **Heavy metals** — `Yes` = sum of Pb, Cd, Hg, Cr6+ explicitly below 100 mg / ppm / mg/kg; "
-        "`No` = non-compliant; `N/A` = not stated in documents.\n\n"
-        "- **SoC** — `Yes` = Substances of Concern explicitly present; "
-        "`No` = explicitly absent or not detected; `N/A` = not mentioned."
+        "**Heavy metals compliance**\n"
+        "- `Yes` = sum of Pb, Cd, Hg, Cr6+ explicitly below 100 mg / ppm / mg/kg\n"
+        "- `No` = non-compliant (above limit or explicitly not compliant)\n"
+        "- `N/A` = not stated in documents\n\n"
+        "**SoC compliance**\n"
+        "- `Yes` = substances absent or not detected (compliant)\n"
+        "- `No` = substances present (non-compliant)\n"
+        "- `N/A` = not mentioned in documents"
     )
 
     detail = build_detail_rows(df)
 
     st.subheader("Summary — suppliers per check")
-    st.caption("Heavy metals: compliant suppliers. SoC: suppliers with an explicit yes/no declaration.")
+    st.caption("Heavy metals and SoC: count of compliant suppliers (Yes).")
     cols = st.columns(len(CHECK_ORDER))
     summary_labels = {
         "Heavy metals": "Compliant (Yes)",
-        "SoC": "Explicit declaration (Yes or No)",
+        "SoC": "Compliant (Yes — absent or not detected)",
     }
     for col, check in zip(cols, CHECK_ORDER):
-        sub = detail[detail["Check"] == check]
-        n_ok, n_tot = summary_count(check, sub["Answer"])
+        sub = detail[detail["Check_key"] == check]
+        n_ok, n_tot = summary_count(sub["Answer_display"])
         with col:
             st.metric(
-                check,
+                CHECK_DISPLAY[check],
                 f"{n_ok} / {n_tot}",
-                help=f"{summary_labels[check]} for **{check}**",
+                help=f"{summary_labels[check]} for **{CHECK_DISPLAY[check]}**",
             )
 
     st.subheader("Matrix — Supplier × check")
-    pivot = detail.pivot_table(
-        index=["Supplier No.", "Supplier"],
-        columns="Check",
-        values="Answer_display",
-        aggfunc="first",
-    )
-    for check in CHECK_ORDER:
-        if check not in pivot.columns:
-            pivot[check] = "N/A"
-    pivot = pivot[CHECK_ORDER].fillna("N/A")
-
-    matrix_df = pivot.reset_index()
+    matrix_rows: List[Dict] = []
+    for (supplier_no, supplier), group in detail.groupby(["Supplier No.", "Supplier"], sort=False):
+        row: Dict = {"Supplier No.": supplier_no, "Supplier": supplier}
+        for check in CHECK_ORDER:
+            rec = group[group["Check_key"] == check].iloc[0]
+            row[CHECK_DISPLAY[check]] = rec["Matrix_cell"]
+        matrix_rows.append(row)
+    matrix_df = pd.DataFrame(matrix_rows)
+    matrix_display_cols = [CHECK_DISPLAY[c] for c in CHECK_ORDER]
 
     def _style_matrix(df_in: pd.DataFrame) -> pd.DataFrame:
         styled = df_in.style
-        for check in CHECK_ORDER:
+        for check, col_name in zip(CHECK_ORDER, matrix_display_cols):
             styled = styled.apply(
                 lambda col, c=check: [_matrix_cell_style(c, v) for v in col],
-                subset=[check],
+                subset=[col_name],
                 axis=0,
             )
         return styled
@@ -247,41 +366,72 @@ def main() -> None:
     st.dataframe(_style_matrix(matrix_df), use_container_width=True, hide_index=True)
 
     st.subheader("Details by supplier")
-    suppliers_sorted = sorted(detail["Supplier"].unique())
-    pick_supplier = st.selectbox("Select supplier", options=suppliers_sorted, index=0)
-    sub = detail[detail["Supplier"] == pick_supplier].copy()
+    supplier_options = [
+        f"{s} ({n})"
+        for s, n in sorted(
+            detail[["Supplier", "Supplier No."]].drop_duplicates().values.tolist()
+        )
+    ]
+    pick_label = st.selectbox("Select supplier", options=supplier_options, index=0)
+    pick_supplier = pick_label.rsplit(" (", 1)[0]
+    pick_no = pick_label.rsplit(" (", 1)[1].rstrip(")")
+    sub = detail[
+        (detail["Supplier"] == pick_supplier) & (detail["Supplier No."] == pick_no)
+    ].copy()
 
     show = sub[
         [
             "Check",
             "Answer_display",
-            "Concentration",
+            "Concentration_display",
             "Evidence",
             "Source document",
         ]
-    ].rename(columns={"Answer_display": "Answer"})
+    ].rename(columns={"Answer_display": "Answer", "Concentration_display": "Concentration"})
     st.dataframe(
         show,
         use_container_width=True,
         hide_index=True,
         column_config={
+            "Concentration": st.column_config.TextColumn(
+                "Concentration",
+                help="Shown only when non-compliant (Heavy metals: No; SoC compliance: No).",
+            ),
             "Evidence": st.column_config.TextColumn("Evidence", width="large"),
             "Source document": st.column_config.TextColumn("Source document", width="medium"),
         },
     )
 
     with st.expander("Show all supplier × check rows (long table)"):
+        long_table = detail.sort_values(["Supplier", "Check"]).copy()
+        long_table["Concentration"] = long_table["Concentration_display"]
         st.dataframe(
-            detail.sort_values(["Supplier", "Check"]),
+            long_table[
+                [
+                    "Supplier No.",
+                    "Supplier",
+                    "Check",
+                    "Answer_display",
+                    "Concentration",
+                    "Evidence",
+                    "Source document",
+                ]
+            ].rename(columns={"Answer_display": "Answer"}),
             use_container_width=True,
             hide_index=True,
         )
 
     st.markdown("---")
-    st.caption(
-        "Internal tool — PPWR supplier audit based on regulatory PDFs in `docs/`. "
-        "Regenerate results with `python ppwr_audit.py`."
-    )
+    if IS_STREAMLIT_CLOUD:
+        st.caption(
+            "Internal tool — PPWR supplier compliance dashboard. "
+            "Data from `ppwr_audit_results.csv` in the repository."
+        )
+    else:
+        st.caption(
+            "Internal tool designed by Léo Albarede — PPWR supplier audit based on regulatory PDFs in `docs/`. "
+            "Regenerate results with `python ppwr_audit.py --with-evidence-columns`."
+        )
 
 
 if __name__ == "__main__":

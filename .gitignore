@@ -6,3 +6,6 @@ tiktoken_cache/
 flashrank_cache/
 __pycache__/
 *.pyc
+*.log
+ppwr_audit_run.log
+.streamlit/secrets.toml

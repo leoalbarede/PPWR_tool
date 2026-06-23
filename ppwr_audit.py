@@ -16,7 +16,13 @@ from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
-from analyzer_docling import ask_pdf_multi_section
+from analyzer_docling import ask_pdf_multi_section, get_document_markdown
+from evidence_validator import (
+    CHECK_HEAVY_METALS,
+    CHECK_SOC,
+    reject_shared_evidence,
+    validate_point_finding,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(BASE_DIR, "docs")
@@ -32,6 +38,11 @@ STRICT RULES (zero hallucination):
 - If the CONTEXT does not explicitly support an answer, write N/A for that field.
 - Evidence MUST be a verbatim quote copied from the CONTEXT (short excerpt, max 300 characters).
 - If no quote supports the answer, set Answer to N/A and Evidence to NONE.
+- YES or NO is forbidden without a verbatim Evidence quote — use N/A instead.
+- The Evidence quote MUST appear word-for-word in the CONTEXT. If you cannot copy an exact quote, use N/A.
+- Answer N/A if the only relevant text describes legal/regulatory requirements (e.g. PPWR Article 5 limits)
+  rather than the supplier's own declaration about their packaging materials or products.
+- Each numbered point requires its OWN evidence quote. Never reuse evidence from another point or topic.
 - Source document is the filename provided in the task header.
 - For concentrations, copy the exact value and unit as written (e.g. mg/kg, ppm, mg). Do not convert units.
 
@@ -52,7 +63,9 @@ PPWR_SECTIONS: List[Tuple[str, str]] = [
    and hexavalent chromium (Cr6+) in packaging and its components below 100 mg (or 100 ppm / mg/kg
    as stated in the document)? Answer YES if explicitly compliant below the limit, NO if explicitly
    above or non-compliant, N/A if not stated.
+   Answer N/A if the only quote describes PPWR/legal requirements, not the supplier's own material.
    If YES or NO, report the total or individual concentrations when explicitly given.
+   Evidence must mention Pb, Cd, Hg, Cr6+ or heavy metals — not SoC/SVHC alone.
 """.strip(),
     ),
     (
@@ -63,7 +76,9 @@ PPWR_SECTIONS: List[Tuple[str, str]] = [
    high concern (SVHC), CMRs, or other restricted substances under PPWR Article 5 other than PFAS.
    Answer YES if SoC are present or declared above detection limits, NO if explicitly absent or
    not detected, N/A if SoC are not mentioned at all in the document.
+   Answer N/A if the only quote describes PPWR/legal requirements, not the supplier's own material.
    If YES or NO with a quantitative statement, report the concentration(s) exactly as written.
+   Evidence must mention Substances of Concern, SVHC, CMR, or similar — NOT heavy metals (Pb/Cd/Hg/Cr6+) alone.
 """.strip(),
     ),
 ]
@@ -174,6 +189,27 @@ def _extract_section_body(answer_text: str, title_keywords: Tuple[str, ...]) -> 
     return ""
 
 
+def _extract_point_block(section_body: str, point_num: int) -> str:
+    """Keep only the block for Point N when the LLM returns multiple points."""
+    if not section_body:
+        return ""
+    markers = list(
+        re.finditer(
+            rf"(?:^|\n)(?:Point\s+(\d+)\s*:|\s*(\d+)\.\s+)",
+            section_body,
+            re.IGNORECASE,
+        )
+    )
+    for i, match in enumerate(markers):
+        num = int(match.group(1) or match.group(2))
+        if num != point_num:
+            continue
+        start = match.start()
+        end = markers[i + 1].start() if i + 1 < len(markers) else len(section_body)
+        return section_body[start:end].strip()
+    return section_body.strip()
+
+
 def _parse_point_block(block: str) -> PointFinding:
     finding = PointFinding()
 
@@ -200,7 +236,7 @@ def _parse_point_block(block: str) -> PointFinding:
     if notes_m:
         finding.notes = notes_m.group(1).strip()
 
-    if finding.answer == "N/A" or finding.evidence == "NONE":
+    if finding.answer in ("yes", "no") and finding.evidence in ("", "NONE"):
         finding.answer = "N/A"
         finding.concentration = "N/A"
 
@@ -215,10 +251,10 @@ def parse_rag_answer(answer_text: str, source_file: str) -> PdfFinding:
     soc_body = _extract_section_body(answer_text, ("SoC", "Substances of Concern"))
 
     if hm_body:
-        result.heavy_metals = _parse_point_block(hm_body)
+        result.heavy_metals = _parse_point_block(_extract_point_block(hm_body, 1))
         result.heavy_metals.source_document = source_file
     if soc_body:
-        result.soc = _parse_point_block(soc_body)
+        result.soc = _parse_point_block(_extract_point_block(soc_body, 2))
         result.soc.source_document = source_file
 
     return result
@@ -236,20 +272,30 @@ def analyze_pdf(pdf_path: str, api_key: str, k: int = 5) -> PdfFinding:
         sections=PPWR_SECTIONS,
         api_key=api_key,
         k=k,
+        retry_na_sections=True,
     )
-    return parse_rag_answer(rag.get("answer", ""), source_file)
+    finding = parse_rag_answer(rag.get("answer", ""), source_file)
+    source_markdown = get_document_markdown(pdf_path)
+    finding.heavy_metals = validate_point_finding(
+        finding.heavy_metals, source_markdown, CHECK_HEAVY_METALS
+    )
+    finding.soc = validate_point_finding(finding.soc, source_markdown, CHECK_SOC)
+    finding.heavy_metals, finding.soc = reject_shared_evidence(
+        finding.heavy_metals, finding.soc
+    )
+    return finding
+
+
+def _has_evidence(finding: PointFinding) -> bool:
+    return finding.evidence not in ("", "NONE")
 
 
 def _pick_best(findings: List[PointFinding]) -> PointFinding:
-    """Prefer answers backed by evidence; YES/NO over N/A."""
-    ranked = sorted(
-        findings,
-        key=lambda f: (
-            0 if f.answer in ("yes", "no") and f.evidence not in ("", "NONE") else 1,
-            0 if f.answer in ("yes", "no") else 1,
-        ),
-    )
-    return ranked[0] if ranked else PointFinding()
+    """Prefer yes/no answers backed by verbatim evidence; otherwise N/A."""
+    backed = [f for f in findings if f.answer in ("yes", "no") and _has_evidence(f)]
+    if backed:
+        return backed[0]
+    return PointFinding()
 
 
 def _format_concentration(hm: PointFinding, soc: PointFinding, with_citations: bool) -> str:
