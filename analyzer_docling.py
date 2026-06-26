@@ -68,9 +68,9 @@ NA_RETRY_QUERIES: Dict[str, List[str]] = {
         "heavy metals packaging components limit declaration",
     ],
     "soc": [
-        "substances of concern SVHC packaging material concentration detected",
-        "SoC substances of concern absent not detected packaging components",
-        "REACH SVHC candidate list packaging material 0.1%",
+        "substances of concern Article 3 packaging Regulation EU 2025/40",
+        "SoC absent not present Annex XIV XVII REACH CMR STOT PBT recyclability",
+        "substances of concern recycling streams packaging material declaration",
     ],
     "pfas": [
         "PFAS perfluoro polyfluoro packaging material µg/kg",
@@ -601,8 +601,9 @@ def ask_pdf_multi_section(
         title_lower = title.lower()
         if "soc" in title_lower or "substances of concern" in title_lower:
             query_llm += (
-                "IMPORTANT: Evidence for SoC must mention Substances of Concern, SVHC, or CMR. "
-                "Do NOT reuse quotes about Pb/Cd/Hg/Cr6+/heavy metals. Use N/A if only heavy metals are discussed.\n\n"
+                "IMPORTANT: Evidence for SoC must relate to Substances of Concern under PPWR Article 3(2)(a) "
+                "(REACH Annex XIV/XVII, CMR, STOT/PBT/vPvB, recyclability). "
+                "Do NOT reuse heavy metals or PFAS quotes. Use N/A if SoC is not discussed.\n\n"
             )
         elif "heavy metal" in title_lower or "pb, cd" in title_lower:
             query_llm += (

@@ -73,14 +73,20 @@ PPWR_SECTIONS: List[Tuple[str, str]] = [
     (
         "PPWR — Substances of Concern (SoC)",
         """
-2. Substances of Concern (SoC) in packaging materials and components: Is the presence of SoC
-   explicitly mentioned (NOT PFAS — PFAS is a separate topic)? SoC includes substances of very
-   high concern (SVHC), CMRs, or other restricted substances under PPWR Article 5 other than PFAS.
-   Answer YES if SoC are present or declared above detection limits, NO if explicitly absent or
-   not detected, N/A if SoC are not mentioned at all in the document.
-   Answer N/A if the only quote describes PPWR/legal requirements, not the supplier's own material.
-   If YES or NO with a quantitative statement, report the concentration(s) exactly as written.
-   Evidence must mention Substances of Concern, SVHC, CMR, or similar — NOT heavy metals (Pb/Cd/Hg/Cr6+) or PFAS alone.
+2. Substances of Concern (SoC) in packaging per Article 3(2)(a) of Regulation (EU) 2025/40 (PPWR).
+   NOT PFAS (separate check) and NOT standalone SVHC Article 9 declarations unless about SoC criteria below.
+   A substance is SoC if it meets ANY of: (i) listed in Annex XIV REACH; (ii) classified STOT with PBT/vPvB;
+   (iii) listed in Annex XVII REACH; (iv) classified CMR; (v) adverse effect on environment or human health
+   upon release from packaging; (vi) impedes recyclability or re-use; (vii) contaminates recycling streams
+   or final recycled products.
+   Answer YES if one or more SoC are present or declared in the supplier's packaging materials.
+   Answer NO if the supplier explicitly states no Substances of Concern are present in their packaging
+   (none of criteria (i)–(vii) apply to substances in their materials).
+   Answer N/A if SoC / Article 3(2)(a) is not mentioned at all.
+   Answer N/A if the only quote describes legal requirements only, not the supplier's own material.
+   If YES or NO with quantitative values, report concentrations exactly as written.
+   Evidence must mention Substances of Concern, Article 3, REACH Annex XIV/XVII, CMR, STOT, PBT, vPvB,
+   recyclability, or recycling streams — NOT heavy metals or PFAS alone.
 """.strip(),
     ),
     (

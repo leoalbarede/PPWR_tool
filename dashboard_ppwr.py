@@ -161,13 +161,8 @@ def format_concentration(concentration: str, raw_answer: str, check: str) -> str
     return conc
 
 
-def matrix_cell_value(
-    answer_display: str, raw_answer: str, check: str, concentration: str
-) -> str:
-    if is_non_compliant(check, raw_answer):
-        conc = format_concentration(concentration, raw_answer, check)
-        if conc != "—":
-            return f"{answer_display}\n{conc}"
+def matrix_cell_value(answer_display: str) -> str:
+    """Matrix shows Yes / No / N/A only (no concentration or extra text)."""
     return answer_display
 
 
@@ -266,7 +261,7 @@ def resolve_check(row: pd.Series, check: str) -> CheckResult:
                 break
     answer_display = display_answer_for_check(check, answer)
     conc_display = format_concentration(concentration, answer, check)
-    matrix_cell = matrix_cell_value(answer_display, answer, check, concentration)
+    matrix_cell = matrix_cell_value(answer_display)
     ev_out = evidence if evidence_ok(evidence) else "—"
     src_out = source if evidence_ok(evidence) else "—"
     return CheckResult(
@@ -307,8 +302,8 @@ def build_detail_rows(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _matrix_cell_style(check_key: str, display_value: str) -> str:
-    v = str(display_value).strip().split("\n")[0]
+def _matrix_cell_style(display_value: str) -> str:
+    v = str(display_value).strip()
     if v == "N/A":
         return "background-color: #e2e3e5; color: #383d41"
     if v == "Yes":
@@ -367,8 +362,9 @@ def main() -> None:
         "**Heavy metals compliance**\n"
         "- `Yes` = sum of Pb, Cd, Hg, Cr6+ explicitly below 100 mg / ppm / mg/kg\n"
         "- `No` = non-compliant | `N/A` = not stated\n\n"
-        "**SoC compliance**\n"
-        "- `Yes` = absent or not detected | `No` = present | `N/A` = not mentioned\n\n"
+        "**SoC compliance** (Article 3(2)(a), Regulation EU 2025/40)\n"
+        "- `Yes` = no Substances of Concern in packaging (none of criteria i–vii)\n"
+        "- `No` = one or more SoC detected | `N/A` = not mentioned\n\n"
         "**PFAS compliance**\n"
         "- `Yes` = no PFAS detected (below EU limits: 25 µg/kg individual, 250 µg/kg sum, 50 mg/kg total)\n"
         "- `No` = PFAS above limits | `N/A` = not mentioned\n\n"
@@ -383,7 +379,7 @@ def main() -> None:
     cols = st.columns(len(CHECK_ORDER))
     summary_labels = {
         "Heavy metals": "Compliant (Yes)",
-        "SoC": "Compliant (Yes — absent or not detected)",
+        "SoC": "Compliant (Yes — no SoC per Art. 3(2)(a))",
         "PFAS": "Compliant (Yes — not detected / below limits)",
         "SVHC": "Conform (Yes — below 0.1% w/w)",
     }
@@ -414,9 +410,9 @@ def main() -> None:
 
     def _style_matrix(df_in: pd.DataFrame) -> pd.DataFrame:
         styled = df_in.style
-        for check, col_name in zip(CHECK_ORDER, check_cols):
+        for col_name in check_cols:
             styled = styled.apply(
-                lambda col, c=check: [_matrix_cell_style(c, v) for v in col],
+                lambda col: [_matrix_cell_style(v) for v in col],
                 subset=[col_name],
                 axis=0,
             )

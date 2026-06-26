@@ -49,7 +49,16 @@ _SOC_TOPIC_RE = re.compile(
     r"(?:"
     r"substances?\s+of\s+concern|"
     r"\bsoc\b|"
+    r"article\s*3\s*[\(\[]?\s*2\s*[\)\]]?\s*[\(\[]?\s*a|"
+    r"regulation\s*\(eu\)\s*2025\s*/\s*40|"
+    r"annex\s*xiv|"
+    r"annex\s*xvii|"
     r"\bcmr\b|"
+    r"\bstot\b|"
+    r"\bpbt\b|"
+    r"\bvpvb\b|"
+    r"recyclab|"
+    r"recycling\s+stream|"
     r"concern\s+substances?"
     r")",
     re.IGNORECASE,
