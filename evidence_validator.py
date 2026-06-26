@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import html
 import re
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 MIN_EVIDENCE_CHARS = 15
 
 CHECK_HEAVY_METALS = "heavy_metals"
 CHECK_SOC = "soc"
+CHECK_PFAS = "pfas"
+CHECK_SVHC = "svhc"
+
+CHECK_ORDER = [CHECK_HEAVY_METALS, CHECK_SOC, CHECK_PFAS, CHECK_SVHC]
 
 # Topic signals — evidence must match the check it supports.
 _HM_TOPIC_RE = re.compile(
@@ -28,15 +32,46 @@ _SOC_TOPIC_RE = re.compile(
     r"(?:"
     r"substances?\s+of\s+concern|"
     r"\bsoc\b|"
-    r"svhc|"
-    r"substances?\s+of\s+very\s+high\s+concern|"
     r"\bcmr\b|"
-    r"reach\s+candidate|"
-    r"authorisation\s+list|"
     r"concern\s+substances?"
     r")",
     re.IGNORECASE,
 )
+
+_PFAS_TOPIC_RE = re.compile(
+    r"(?:"
+    r"\bpfas\b|"
+    r"per-?\s*and\s*polyfluoro|"
+    r"perfluoro|"
+    r"polyfluoro|"
+    r"fluorinated\s+alkyl|"
+    r"25\s*(?:µg|ug)/kg|"
+    r"250\s*(?:µg|ug)/kg|"
+    r"50\s*mg/kg.*pfas|"
+    r"total\s+pfas|"
+    r"polymeric\s+pfas"
+    r")",
+    re.IGNORECASE,
+)
+
+_SVHC_TOPIC_RE = re.compile(
+    r"(?:"
+    r"\bsvhc\b|"
+    r"substances?\s+of\s+very\s+high\s+concern|"
+    r"reach\s+candidate|"
+    r"authorisation\s+list|"
+    r"article\s*9|"
+    r"0\.1\s*%\s*(?:w/w|by\s+weight)?"
+    r")",
+    re.IGNORECASE,
+)
+
+_TOPIC_RES: Dict[str, re.Pattern] = {
+    CHECK_HEAVY_METALS: _HM_TOPIC_RE,
+    CHECK_SOC: _SOC_TOPIC_RE,
+    CHECK_PFAS: _PFAS_TOPIC_RE,
+    CHECK_SVHC: _SVHC_TOPIC_RE,
+}
 
 # Legal / regulatory wording without a supplier material declaration.
 _LEGAL_BOILERPLATE_RE = re.compile(
@@ -91,22 +126,27 @@ def evidence_in_source(evidence: str, source_markdown: str) -> bool:
     ev_trim = ev.rstrip(".,;:")
     if ev_trim in src:
         return True
-    # Allow minor truncation at end (LLM may shorten long quotes).
     if len(ev) > 40 and ev[: max(40, len(ev) - 20)] in src:
         return True
     return False
 
 
 def evidence_matches_check(evidence: str, check: str) -> bool:
-    """True when the quote is on-topic for heavy metals or SoC (not the other check)."""
+    """True when the quote is on-topic for the requested PPWR check."""
     if not evidence or evidence.strip().upper() == "NONE":
         return False
+    pattern = _TOPIC_RES.get(check)
+    if pattern is None:
+        return True
+    if not pattern.search(evidence):
+        return False
     hm = bool(_HM_TOPIC_RE.search(evidence))
-    soc = bool(_SOC_TOPIC_RE.search(evidence))
-    if check == CHECK_HEAVY_METALS:
-        return hm and not (soc and not hm)
-    if check == CHECK_SOC:
-        return soc and not (hm and not soc)
+    if check == CHECK_SOC and hm and not _SOC_TOPIC_RE.search(evidence):
+        return False
+    if check == CHECK_SVHC and _PFAS_TOPIC_RE.search(evidence) and not _SVHC_TOPIC_RE.search(evidence):
+        return False
+    if check == CHECK_PFAS and _SVHC_TOPIC_RE.search(evidence) and not _PFAS_TOPIC_RE.search(evidence):
+        return False
     return True
 
 
@@ -127,32 +167,33 @@ def _downgrade_finding(finding, notes: str):
     finding.notes = notes
 
 
-def reject_shared_evidence(hm_finding, soc_finding):
-    """If both checks reuse the same quote, keep it only for the matching topic."""
-    if hm_finding.answer not in ("yes", "no") or soc_finding.answer not in ("yes", "no"):
-        return hm_finding, soc_finding
-    if not _evidence_same_quote(hm_finding.evidence, soc_finding.evidence):
-        return hm_finding, soc_finding
-
-    hm_match = evidence_matches_check(hm_finding.evidence, CHECK_HEAVY_METALS)
-    soc_match = evidence_matches_check(soc_finding.evidence, CHECK_SOC)
-
-    if hm_match and not soc_match:
-        _downgrade_finding(
-            soc_finding,
-            "Evidence relates to heavy metals only, not Substances of Concern.",
-        )
-    elif soc_match and not hm_match:
-        _downgrade_finding(
-            hm_finding,
-            "Evidence relates to SoC only, not heavy metals.",
-        )
-    else:
-        _downgrade_finding(
-            soc_finding,
-            "Same evidence as heavy metals check; not valid for SoC.",
-        )
-    return hm_finding, soc_finding
+def dedupe_findings(findings: Dict[str, object]) -> Dict[str, object]:
+    """Downgrade checks that reuse another check's quote without a matching topic."""
+    for i, check_i in enumerate(CHECK_ORDER):
+        fi = findings.get(check_i)
+        if fi is None or fi.answer not in ("yes", "no"):
+            continue
+        for check_j in CHECK_ORDER[:i]:
+            fj = findings.get(check_j)
+            if fj is None or fj.answer not in ("yes", "no"):
+                continue
+            if not _evidence_same_quote(fi.evidence, fj.evidence):
+                continue
+            match_i = evidence_matches_check(fi.evidence, check_i)
+            match_j = evidence_matches_check(fj.evidence, check_j)
+            if match_j and not match_i:
+                _downgrade_finding(
+                    fi,
+                    f"Evidence relates to {check_j.replace('_', ' ')} only.",
+                )
+                break
+            if not match_i and _evidence_same_quote(fi.evidence, fj.evidence):
+                _downgrade_finding(
+                    fi,
+                    f"Same evidence as {check_j.replace('_', ' ')} check; not valid here.",
+                )
+                break
+    return findings
 
 
 def soc_evidence_duplicates_heavy_metals(hm_evidence: str, soc_evidence: str) -> bool:
@@ -168,10 +209,20 @@ def soc_evidence_duplicates_heavy_metals(hm_evidence: str, soc_evidence: str) ->
     return False
 
 
+def evidence_duplicates_prior_check(
+    prior_evidence: str, check_evidence: str, prior_check: str, check: str
+) -> bool:
+    if not _evidence_same_quote(prior_evidence, check_evidence):
+        return False
+    prior_match = evidence_matches_check(prior_evidence, prior_check)
+    check_match = evidence_matches_check(check_evidence, check)
+    if prior_match and not check_match:
+        return True
+    return False
+
+
 def is_regulatory_boilerplate_only(evidence: str) -> bool:
-    """
-    True when the quote looks like PPWR/legal text only, not a supplier material statement.
-    """
+    """True when the quote looks like PPWR/legal text only, not a supplier material statement."""
     if not evidence or evidence.strip().upper() == "NONE":
         return False
     has_legal = bool(_LEGAL_BOILERPLATE_RE.search(evidence))
@@ -210,3 +261,10 @@ def validate_point_finding(
         )
         return finding
     return finding
+
+
+# Backward compatibility
+def reject_shared_evidence(hm_finding, soc_finding):
+    findings = {CHECK_HEAVY_METALS: hm_finding, CHECK_SOC: soc_finding}
+    dedupe_findings(findings)
+    return hm_finding, soc_finding

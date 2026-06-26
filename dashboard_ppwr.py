@@ -18,26 +18,57 @@ import pandas as pd
 import streamlit as st
 
 from evidence_validator import (
+    CHECK_HEAVY_METALS,
+    CHECK_PFAS,
+    CHECK_SOC,
+    CHECK_SVHC,
+    evidence_duplicates_prior_check,
     evidence_matches_check,
     is_regulatory_boilerplate_only,
-    soc_evidence_duplicates_heavy_metals,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULT_PATH = os.path.join(BASE_DIR, "ppwr_audit_results.csv")
 IS_STREAMLIT_CLOUD = bool(os.getenv("STREAMLIT_SHARING_MODE") or os.getenv("STREAMLIT_SERVER_HEADLESS"))
 
-CHECK_ORDER = ["Heavy metals", "SoC"]
+CHECK_ORDER = ["Heavy metals", "SoC", "PFAS", "SVHC"]
+INVERTED_CHECKS = {"SoC", "PFAS", "SVHC"}
 
 CHECK_DISPLAY: Dict[str, str] = {
     "Heavy metals": "Heavy metals compliance",
     "SoC": "SoC compliance",
+    "PFAS": "PFAS compliance",
+    "SVHC": "SVHC conformity",
 }
 
 COL_HEAVY_METALS = "PPWR compliant with heavy metals concentration limit"
 COL_SOC = "PPWR SoC content"
+COL_PFAS = "PPWR PFAS content"
+COL_SVHC = "PPWR SVHC content"
 COL_CONCENTRATION = "Concentration"
 COL_DOC_LIST = "Doc list"
+
+CHECK_TO_COLUMN: Dict[str, str] = {
+    "Heavy metals": COL_HEAVY_METALS,
+    "SoC": COL_SOC,
+    "PFAS": COL_PFAS,
+    "SVHC": COL_SVHC,
+}
+
+CHECK_TO_VALIDATOR: Dict[str, str] = {
+    "Heavy metals": CHECK_HEAVY_METALS,
+    "SoC": CHECK_SOC,
+    "PFAS": CHECK_PFAS,
+    "SVHC": CHECK_SVHC,
+}
+
+EVIDENCE_COLUMNS: Dict[str, Tuple[str, str]] = {
+    "Heavy metals": ("Heavy metals evidence", "Heavy metals source document"),
+    "SoC": ("SoC evidence", "SoC source document"),
+    "PFAS": ("PFAS evidence", "PFAS source document"),
+    "SVHC": ("SVHC evidence", "SVHC source document"),
+}
+
 
 def _row_doc_list(row: pd.Series) -> str:
     if COL_DOC_LIST not in row.index:
@@ -56,13 +87,8 @@ def _matrix_group_cols(df: pd.DataFrame) -> List[str]:
     return cols
 
 
-CHECK_TO_COLUMN: Dict[str, str] = {
-    "Heavy metals": COL_HEAVY_METALS,
-    "SoC": COL_SOC,
-}
-
 _EVIDENCE_IN_CONC_RE = re.compile(
-    r'(?P<topic>Heavy metals|SoC)\s*(?:'
+    r'(?P<topic>Heavy metals|SoC|PFAS|SVHC)\s*(?:'
     r':\s*(?P<conc>.*?)\s*)?'
     r'\[(?P<doc>[^:]+):\s*"(?P<quote>[^"]*)"\]',
     re.IGNORECASE,
@@ -82,10 +108,9 @@ def enforce_evidence(raw_answer: str, evidence: str, check: str | None = None) -
         return "N/A"
     if is_regulatory_boilerplate_only(evidence):
         return "N/A"
-    if check == "Heavy metals" and not evidence_matches_check(evidence, "heavy_metals"):
-        return "N/A"
-    if check == "SoC" and not evidence_matches_check(evidence, "soc"):
-        return "N/A"
+    if check and check in CHECK_TO_VALIDATOR:
+        if not evidence_matches_check(evidence, CHECK_TO_VALIDATOR[check]):
+            return "N/A"
     return norm
 
 
@@ -110,24 +135,24 @@ def display_answer(value) -> str:
 
 
 def display_answer_for_check(check: str, value) -> str:
-    """Map raw CSV answers to compliance display (SoC is inverted: yes in CSV = present)."""
+    """Map raw CSV answers to compliance display (inverted checks: yes = present/non-compliant)."""
     norm = normalize_answer(value)
-    if check == "SoC":
+    if check in INVERTED_CHECKS:
         if norm == "no":
-            return "Yes"  # absent / not detected → compliant
+            return "Yes"
         if norm == "yes":
-            return "No"  # present → non-compliant
+            return "No"
         return "N/A"
     return display_answer(value)
 
 
 def is_non_compliant(check: str, raw_answer: str) -> bool:
-    """Non-compliant from raw CSV: Heavy metals No, SoC Yes (SoC present)."""
+    """Non-compliant from raw CSV."""
     norm = normalize_answer(raw_answer)
+    if check in INVERTED_CHECKS:
+        return norm == "yes"
     if check == "Heavy metals":
         return norm == "no"
-    if check == "SoC":
-        return norm == "yes"
     return False
 
 
@@ -163,7 +188,13 @@ def _parse_concentration_field(text: str, check: str | None = None) -> Dict[str,
         return out
     for m in _EVIDENCE_IN_CONC_RE.finditer(str(text)):
         topic = m.group("topic")
-        key = "Heavy metals" if topic.lower().startswith("heavy") else "SoC"
+        key_map = {
+            "heavy metals": "Heavy metals",
+            "soc": "SoC",
+            "pfas": "PFAS",
+            "svhc": "SVHC",
+        }
+        key = key_map.get(topic.lower(), topic)
         if check is not None and key != check:
             continue
         out[key] = {
@@ -178,10 +209,7 @@ def _row_evidence(row: pd.Series, check: str) -> Tuple[str, str, str]:
     """Return (concentration, evidence, source_document) for a check."""
     parsed = _parse_concentration_field(row.get(COL_CONCENTRATION, ""), check=check)
 
-    if check == "Heavy metals":
-        ev_col, doc_col = "Heavy metals evidence", "Heavy metals source document"
-    else:
-        ev_col, doc_col = "SoC evidence", "SoC source document"
+    ev_col, doc_col = EVIDENCE_COLUMNS[check]
 
     evidence = ""
     source = ""
@@ -197,7 +225,7 @@ def _row_evidence(row: pd.Series, check: str) -> Tuple[str, str, str]:
 
     conc_raw = str(row.get(COL_CONCENTRATION, "") or "")
     if concentration == "N/A" and conc_raw and not pd.isna(conc_raw):
-        prefix = "Heavy metals:" if check == "Heavy metals" else "SoC:"
+        prefix = f"{check}:"
         for part in conc_raw.split(";"):
             part = part.strip()
             if part.lower().startswith(prefix.lower()):
@@ -223,16 +251,23 @@ def resolve_check(row: pd.Series, check: str) -> CheckResult:
     col = CHECK_TO_COLUMN[check]
     concentration, evidence, source = _row_evidence(row, check)
     answer = enforce_evidence(row.get(col), evidence, check=check)
-    if (
-        check == "SoC"
-        and answer in ("yes", "no")
-        and evidence_ok(evidence)
-        and "Heavy metals evidence" in row.index
-    ):
-        hm_evidence = str(row.get("Heavy metals evidence", "") or "").strip()
-        if soc_evidence_duplicates_heavy_metals(hm_evidence, evidence):
-            answer = "N/A"
-            evidence = ""
+    if answer in ("yes", "no") and evidence_ok(evidence):
+        for prior_check in CHECK_ORDER:
+            if prior_check == check:
+                break
+            prior_ev_col = EVIDENCE_COLUMNS[prior_check][0]
+            if prior_ev_col not in row.index:
+                continue
+            prior_evidence = str(row.get(prior_ev_col, "") or "").strip()
+            if evidence_duplicates_prior_check(
+                prior_evidence,
+                evidence,
+                CHECK_TO_VALIDATOR[prior_check],
+                CHECK_TO_VALIDATOR[check],
+            ):
+                answer = "N/A"
+                evidence = ""
+                break
     answer_display = display_answer_for_check(check, answer)
     conc_display = format_concentration(concentration, answer, check)
     matrix_cell = matrix_cell_value(answer_display, answer, check, concentration)
@@ -323,7 +358,7 @@ def main() -> None:
         st.warning("The CSV file has no rows.")
         return
 
-    required = {"Supplier No.", "Supplier", COL_HEAVY_METALS, COL_SOC}
+    required = {"Supplier No.", "Supplier", COL_HEAVY_METALS, COL_SOC, COL_PFAS, COL_SVHC}
     missing = required - set(df.columns)
     if missing:
         st.error(f"Missing columns in CSV: {', '.join(sorted(missing))}")
@@ -332,25 +367,29 @@ def main() -> None:
     st.caption(f"Displayed: **{len(df)} supplier(s)** from `{os.path.basename(RESULT_PATH)}`.")
 
     st.info(
-        "**PPWR checks** — Each supplier is assessed on two binary points from regulatory PDFs:\n\n"
+        "**PPWR checks** — Each supplier is assessed on four binary points from regulatory PDFs:\n\n"
         "**Heavy metals compliance**\n"
         "- `Yes` = sum of Pb, Cd, Hg, Cr6+ explicitly below 100 mg / ppm / mg/kg\n"
-        "- `No` = non-compliant (above limit or explicitly not compliant)\n"
-        "- `N/A` = not stated in documents\n\n"
+        "- `No` = non-compliant | `N/A` = not stated\n\n"
         "**SoC compliance**\n"
-        "- `Yes` = substances absent or not detected (compliant)\n"
-        "- `No` = substances present (non-compliant)\n"
-        "- `N/A` = not mentioned in documents"
+        "- `Yes` = absent or not detected | `No` = present | `N/A` = not mentioned\n\n"
+        "**PFAS compliance**\n"
+        "- `Yes` = no PFAS detected (below EU limits: 25 µg/kg individual, 250 µg/kg sum, 50 mg/kg total)\n"
+        "- `No` = PFAS above limits | `N/A` = not mentioned\n\n"
+        "**SVHC conformity**\n"
+        "- `Yes` = no SVHC above 0.1% w/w (PPWR Art. 9) | `No` = above threshold | `N/A` = not mentioned"
     )
 
     detail = build_detail_rows(df)
 
     st.subheader("Summary — suppliers per check")
-    st.caption("Heavy metals and SoC: count of compliant suppliers (Yes).")
+    st.caption("Count of compliant suppliers (Yes) per check.")
     cols = st.columns(len(CHECK_ORDER))
     summary_labels = {
         "Heavy metals": "Compliant (Yes)",
         "SoC": "Compliant (Yes — absent or not detected)",
+        "PFAS": "Compliant (Yes — not detected / below limits)",
+        "SVHC": "Conform (Yes — below 0.1% w/w)",
     }
     for col, check in zip(cols, CHECK_ORDER):
         sub = detail[detail["Check_key"] == check]
@@ -375,10 +414,11 @@ def main() -> None:
         matrix_rows.append(row)
     matrix_df = pd.DataFrame(matrix_rows)
     matrix_display_cols = group_cols + [CHECK_DISPLAY[c] for c in CHECK_ORDER]
+    check_cols = [CHECK_DISPLAY[c] for c in CHECK_ORDER]
 
     def _style_matrix(df_in: pd.DataFrame) -> pd.DataFrame:
         styled = df_in.style
-        for check, col_name in zip(CHECK_ORDER, matrix_display_cols):
+        for check, col_name in zip(CHECK_ORDER, check_cols):
             styled = styled.apply(
                 lambda col, c=check: [_matrix_cell_style(c, v) for v in col],
                 subset=[col_name],
@@ -424,7 +464,7 @@ def main() -> None:
         column_config={
             "Concentration": st.column_config.TextColumn(
                 "Concentration",
-                help="Shown only when non-compliant (Heavy metals: No; SoC compliance: No).",
+                help="Shown only when non-compliant (Heavy metals: No; SoC/PFAS/SVHC: No).",
             ),
             "Evidence": st.column_config.TextColumn("Evidence", width="large"),
             "Source document": st.column_config.TextColumn("Source document", width="medium"),

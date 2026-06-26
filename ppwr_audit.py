@@ -19,8 +19,10 @@ from dotenv import load_dotenv
 from analyzer_docling import ask_pdf_multi_section, get_document_markdown
 from evidence_validator import (
     CHECK_HEAVY_METALS,
+    CHECK_PFAS,
     CHECK_SOC,
-    reject_shared_evidence,
+    CHECK_SVHC,
+    dedupe_findings,
     validate_point_finding,
 )
 
@@ -78,7 +80,32 @@ PPWR_SECTIONS: List[Tuple[str, str]] = [
    not detected, N/A if SoC are not mentioned at all in the document.
    Answer N/A if the only quote describes PPWR/legal requirements, not the supplier's own material.
    If YES or NO with a quantitative statement, report the concentration(s) exactly as written.
-   Evidence must mention Substances of Concern, SVHC, CMR, or similar — NOT heavy metals (Pb/Cd/Hg/Cr6+) alone.
+   Evidence must mention Substances of Concern, SVHC, CMR, or similar — NOT heavy metals (Pb/Cd/Hg/Cr6+) or PFAS alone.
+""".strip(),
+    ),
+    (
+        "PPWR — PFAS",
+        """
+3. PFAS (per- and polyfluoroalkyl substances) in packaging materials: Is PFAS presence or concentration
+   explicitly mentioned? EU PPWR limits: <25 µg/kg per individual PFAS, <250 µg/kg sum of targeted PFAS,
+   <50 mg/kg total PFAS including polymeric PFAS.
+   Answer YES if PFAS are present or declared above these limits, NO if explicitly absent, not detected,
+   or declared below limits, N/A if PFAS are not mentioned at all.
+   Answer N/A if the only quote describes PPWR/legal requirements, not the supplier's own material.
+   If YES or NO with quantitative values, report concentrations exactly as written.
+   Evidence must mention PFAS, perfluoro, or polyfluoro — NOT heavy metals or generic SoC alone.
+""".strip(),
+    ),
+    (
+        "PPWR — SVHC (Article 9)",
+        """
+4. SVHC (Substances of Very High Concern) under PPWR Article 9: Is SVHC presence in packaging materials
+   explicitly mentioned? Concentration limit: 0.1% w/w.
+   Answer YES if SVHC are present or declared above 0.1% w/w, NO if explicitly absent, not detected,
+   or declared below 0.1% w/w, N/A if SVHC are not mentioned at all.
+   Answer N/A if the only quote describes PPWR/legal requirements, not the supplier's own material.
+   If YES or NO with quantitative values, report concentrations exactly as written.
+   Evidence must mention SVHC, substances of very high concern, or Article 9 — NOT PFAS or heavy metals alone.
 """.strip(),
     ),
 ]
@@ -89,11 +116,17 @@ CSV_COLUMNS = [
     "Supplier",
     "PPWR compliant with heavy metals concentration limit",
     "PPWR SoC content",
+    "PPWR PFAS content",
+    "PPWR SVHC content",
     "Concentration",
     "Heavy metals evidence",
     "Heavy metals source document",
     "SoC evidence",
     "SoC source document",
+    "PFAS evidence",
+    "PFAS source document",
+    "SVHC evidence",
+    "SVHC source document",
 ]
 
 # User-facing export (core columns only)
@@ -103,6 +136,8 @@ CSV_COLUMNS_CORE = [
     "Supplier",
     "PPWR compliant with heavy metals concentration limit",
     "PPWR SoC content",
+    "PPWR PFAS content",
+    "PPWR SVHC content",
     "Concentration",
 ]
 
@@ -121,6 +156,8 @@ class PdfFinding:
     source_file: str
     heavy_metals: PointFinding = field(default_factory=PointFinding)
     soc: PointFinding = field(default_factory=PointFinding)
+    pfas: PointFinding = field(default_factory=PointFinding)
+    svhc: PointFinding = field(default_factory=PointFinding)
 
 
 @dataclass
@@ -275,20 +312,41 @@ def _parse_point_block(block: str) -> PointFinding:
 
 
 def parse_rag_answer(answer_text: str, source_file: str) -> PdfFinding:
-    """Parse LLM section output into structured heavy-metals and SoC findings."""
+    """Parse LLM section output into structured findings for all PPWR checks."""
     result = PdfFinding(source_file=source_file)
 
-    hm_body = _extract_section_body(answer_text, ("Heavy metals", "Pb, Cd, Hg"))
-    soc_body = _extract_section_body(answer_text, ("SoC", "Substances of Concern"))
-
-    if hm_body:
-        result.heavy_metals = _parse_point_block(_extract_point_block(hm_body, 1))
-        result.heavy_metals.source_document = source_file
-    if soc_body:
-        result.soc = _parse_point_block(_extract_point_block(soc_body, 2))
-        result.soc.source_document = source_file
+    section_map = [
+        ("heavy_metals", ("Heavy metals", "Pb, Cd, Hg"), 1),
+        ("soc", ("SoC", "Substances of Concern"), 2),
+        ("pfas", ("PFAS",), 3),
+        ("svhc", ("SVHC", "Article 9"), 4),
+    ]
+    for attr, keywords, point_num in section_map:
+        body = _extract_section_body(answer_text, keywords)
+        if body:
+            finding = _parse_point_block(_extract_point_block(body, point_num))
+            finding.source_document = source_file
+            setattr(result, attr, finding)
 
     return result
+
+
+def _validate_pdf_finding(finding: PdfFinding, source_markdown: str) -> PdfFinding:
+    finding.heavy_metals = validate_point_finding(
+        finding.heavy_metals, source_markdown, CHECK_HEAVY_METALS
+    )
+    finding.soc = validate_point_finding(finding.soc, source_markdown, CHECK_SOC)
+    finding.pfas = validate_point_finding(finding.pfas, source_markdown, CHECK_PFAS)
+    finding.svhc = validate_point_finding(finding.svhc, source_markdown, CHECK_SVHC)
+    dedupe_findings(
+        {
+            CHECK_HEAVY_METALS: finding.heavy_metals,
+            CHECK_SOC: finding.soc,
+            CHECK_PFAS: finding.pfas,
+            CHECK_SVHC: finding.svhc,
+        }
+    )
+    return finding
 
 
 def analyze_pdf(pdf_path: str, api_key: str, k: int = 5) -> PdfFinding:
@@ -307,14 +365,7 @@ def analyze_pdf(pdf_path: str, api_key: str, k: int = 5) -> PdfFinding:
     )
     finding = parse_rag_answer(rag.get("answer", ""), source_file)
     source_markdown = get_document_markdown(pdf_path)
-    finding.heavy_metals = validate_point_finding(
-        finding.heavy_metals, source_markdown, CHECK_HEAVY_METALS
-    )
-    finding.soc = validate_point_finding(finding.soc, source_markdown, CHECK_SOC)
-    finding.heavy_metals, finding.soc = reject_shared_evidence(
-        finding.heavy_metals, finding.soc
-    )
-    return finding
+    return _validate_pdf_finding(finding, source_markdown)
 
 
 def _has_evidence(finding: PointFinding) -> bool:
@@ -329,24 +380,27 @@ def _pick_best(findings: List[PointFinding]) -> PointFinding:
     return PointFinding()
 
 
-def _format_concentration(hm: PointFinding, soc: PointFinding, with_citations: bool) -> str:
+def _format_concentration(findings: Dict[str, PointFinding], with_citations: bool) -> str:
+    labels = {
+        "heavy_metals": "Heavy metals",
+        "soc": "SoC",
+        "pfas": "PFAS",
+        "svhc": "SVHC",
+    }
     parts: List[str] = []
-    if hm.concentration not in ("", "N/A"):
-        part = f"Heavy metals: {hm.concentration}"
-        if with_citations and hm.evidence not in ("", "NONE"):
-            part += f' [{hm.source_document}: "{hm.evidence}"]'
-        parts.append(part)
-    if soc.concentration not in ("", "N/A"):
-        part = f"SoC: {soc.concentration}"
-        if with_citations and soc.evidence not in ("", "NONE"):
-            part += f' [{soc.source_document}: "{soc.evidence}"]'
-        parts.append(part)
+    for key, label in labels.items():
+        f = findings[key]
+        if f.concentration not in ("", "N/A"):
+            part = f"{label}: {f.concentration}"
+            if with_citations and f.evidence not in ("", "NONE"):
+                part += f' [{f.source_document}: "{f.evidence}"]'
+            parts.append(part)
     if not parts and with_citations:
         cite_parts: List[str] = []
-        if hm.evidence not in ("", "NONE"):
-            cite_parts.append(f'Heavy metals [{hm.source_document}: "{hm.evidence}"]')
-        if soc.evidence not in ("", "NONE"):
-            cite_parts.append(f'SoC [{soc.source_document}: "{soc.evidence}"]')
+        for key, label in labels.items():
+            f = findings[key]
+            if f.evidence not in ("", "NONE"):
+                cite_parts.append(f'{label} [{f.source_document}: "{f.evidence}"]')
         if cite_parts:
             return "; ".join(cite_parts)
     return "; ".join(parts) if parts else "N/A"
@@ -361,11 +415,18 @@ def aggregate_supplier(
 ) -> Dict[str, str]:
     hm_list = [p.heavy_metals for p in pdf_findings]
     soc_list = [p.soc for p in pdf_findings]
+    pfas_list = [p.pfas for p in pdf_findings]
+    svhc_list = [p.svhc for p in pdf_findings]
 
     hm = _pick_best(hm_list)
     soc = _pick_best(soc_list)
+    pfas = _pick_best(pfas_list)
+    svhc = _pick_best(svhc_list)
 
-    concentration = _format_concentration(hm, soc, with_citations=with_citations_in_concentration)
+    concentration = _format_concentration(
+        {"heavy_metals": hm, "soc": soc, "pfas": pfas, "svhc": svhc},
+        with_citations=with_citations_in_concentration,
+    )
 
     return {
         "Supplier No.": supplier_no,
@@ -373,11 +434,17 @@ def aggregate_supplier(
         "Supplier": supplier,
         "PPWR compliant with heavy metals concentration limit": hm.answer,
         "PPWR SoC content": soc.answer,
+        "PPWR PFAS content": pfas.answer,
+        "PPWR SVHC content": svhc.answer,
         "Concentration": concentration,
         "Heavy metals evidence": hm.evidence,
         "Heavy metals source document": hm.source_document,
         "SoC evidence": soc.evidence,
         "SoC source document": soc.source_document,
+        "PFAS evidence": pfas.evidence,
+        "PFAS source document": pfas.source_document,
+        "SVHC evidence": svhc.evidence,
+        "SVHC source document": svhc.source_document,
     }
 
 
@@ -417,11 +484,17 @@ def run_audit(
                     "Supplier": supplier_name,
                     "PPWR compliant with heavy metals concentration limit": "N/A",
                     "PPWR SoC content": "N/A",
+                    "PPWR PFAS content": "N/A",
+                    "PPWR SVHC content": "N/A",
                     "Concentration": "N/A",
                     "Heavy metals evidence": "NONE",
                     "Heavy metals source document": "",
                     "SoC evidence": "NONE",
                     "SoC source document": "",
+                    "PFAS evidence": "NONE",
+                    "PFAS source document": "",
+                    "SVHC evidence": "NONE",
+                    "SVHC source document": "",
                 }
             )
             continue
@@ -444,7 +517,8 @@ def run_audit(
         rows.append(row)
         print(
             f"  → Heavy metals: {row['PPWR compliant with heavy metals concentration limit']} | "
-            f"SoC: {row['PPWR SoC content']} | Concentration: {row['Concentration']}"
+            f"SoC: {row['PPWR SoC content']} | PFAS: {row['PPWR PFAS content']} | "
+            f"SVHC: {row['PPWR SVHC content']}"
         )
 
     columns = CSV_COLUMNS if include_evidence_columns else CSV_COLUMNS_CORE

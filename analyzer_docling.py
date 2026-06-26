@@ -72,6 +72,16 @@ NA_RETRY_QUERIES: Dict[str, List[str]] = {
         "SoC substances of concern absent not detected packaging components",
         "REACH SVHC candidate list packaging material 0.1%",
     ],
+    "pfas": [
+        "PFAS perfluoro polyfluoro packaging material µg/kg",
+        "PFAS not detected absent fluorinated alkyl substances",
+        "total PFAS polymeric 50 mg/kg 25 µg/kg",
+    ],
+    "svhc": [
+        "SVHC substances of very high concern 0.1% w/w packaging",
+        "SVHC not detected absent REACH candidate list Article 9",
+        "substances of very high concern packaging material concentration",
+    ],
 }
 
 if not os.path.exists(MARKDOWN_CACHE_DIR):
@@ -471,6 +481,10 @@ def _na_retry_queries_for(section_title: str) -> List[str]:
         return NA_RETRY_QUERIES["heavy metals"]
     if "soc" in title or "substances of concern" in title:
         return NA_RETRY_QUERIES["soc"]
+    if "pfas" in title:
+        return NA_RETRY_QUERIES["pfas"]
+    if "svhc" in title or "article 9" in title:
+        return NA_RETRY_QUERIES["svhc"]
     return []
 
 
@@ -593,7 +607,17 @@ def ask_pdf_multi_section(
         elif "heavy metal" in title_lower or "pb, cd" in title_lower:
             query_llm += (
                 "IMPORTANT: Evidence for heavy metals must mention Pb, Cd, Hg, Cr6+, or heavy metals. "
-                "Do NOT reuse SoC/SVHC quotes unless they explicitly state metal limits.\n\n"
+                "Do NOT reuse SoC/SVHC/PFAS quotes unless they explicitly state metal limits.\n\n"
+            )
+        elif "pfas" in title_lower:
+            query_llm += (
+                "IMPORTANT: Evidence for PFAS must mention PFAS, perfluoro, or polyfluoro substances. "
+                "Do NOT reuse heavy metals or SVHC quotes. Use N/A if PFAS are not discussed.\n\n"
+            )
+        elif "svhc" in title_lower or "article 9" in title_lower:
+            query_llm += (
+                "IMPORTANT: Evidence for SVHC must mention SVHC, substances of very high concern, "
+                "or Article 9 / 0.1% w/w. Do NOT reuse PFAS or heavy metals quotes.\n\n"
             )
         query_llm += f"POINTS TO VERIFY:\n{points_stripped}\n"
         source_docs, subqs, rerank_q = _retrieve_for_section(
