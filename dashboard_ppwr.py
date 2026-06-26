@@ -18,10 +18,6 @@ import pandas as pd
 import streamlit as st
 
 from evidence_validator import (
-    CHECK_HEAVY_METALS,
-    CHECK_PFAS,
-    CHECK_SOC,
-    CHECK_SVHC,
     evidence_duplicates_prior_check,
     evidence_matches_check,
     is_regulatory_boilerplate_only,
@@ -56,10 +52,10 @@ CHECK_TO_COLUMN: Dict[str, str] = {
 }
 
 CHECK_TO_VALIDATOR: Dict[str, str] = {
-    "Heavy metals": CHECK_HEAVY_METALS,
-    "SoC": CHECK_SOC,
-    "PFAS": CHECK_PFAS,
-    "SVHC": CHECK_SVHC,
+    "Heavy metals": "heavy_metals",
+    "SoC": "soc",
+    "PFAS": "pfas",
+    "SVHC": "svhc",
 }
 
 EVIDENCE_COLUMNS: Dict[str, Tuple[str, str]] = {

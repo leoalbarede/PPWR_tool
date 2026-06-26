@@ -15,6 +15,23 @@ CHECK_SVHC = "svhc"
 
 CHECK_ORDER = [CHECK_HEAVY_METALS, CHECK_SOC, CHECK_PFAS, CHECK_SVHC]
 
+__all__ = [
+    "CHECK_HEAVY_METALS",
+    "CHECK_SOC",
+    "CHECK_PFAS",
+    "CHECK_SVHC",
+    "CHECK_ORDER",
+    "dedupe_findings",
+    "evidence_duplicates_prior_check",
+    "evidence_in_source",
+    "evidence_matches_check",
+    "is_regulatory_boilerplate_only",
+    "normalize_text_for_match",
+    "reject_shared_evidence",
+    "soc_evidence_duplicates_heavy_metals",
+    "validate_point_finding",
+]
+
 # Topic signals — evidence must match the check it supports.
 _HM_TOPIC_RE = re.compile(
     r"(?:"
