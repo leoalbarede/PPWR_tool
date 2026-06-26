@@ -57,6 +57,19 @@ Binary compliance check on regulatory PDFs per CMO supplier folder under `docs/`
 
 Each subfolder must be named: `{Supplier No} - {Supplier name}` (e.g. `S00122_0100114617 - AMCOR FLEXIBLES SELESTAT`).
 
+Documents can be organized under list folders:
+
+```
+docs/
+  EU (PPWR list Metal Pack)/
+    S00122_0100114617 - AMCOR FLEXIBLES SELESTAT/
+      *.pdf
+  PT (PPWR list) (PrimC (EU)/
+    ...
+```
+
+The CSV and dashboard matrix include a **Doc list** column with the parent folder name.
+
 ```bash
 # List suppliers and PDF counts
 python ppwr_audit.py --list-suppliers
@@ -101,6 +114,7 @@ No Streamlit secrets are required for the dashboard (read-only CSV).
 | Column | Meaning |
 |--------|---------|
 | Supplier No. | Folder prefix before ` - ` |
+| Doc list | Parent folder under `docs/` (e.g. `EU (PPWR list Metal Pack)`) |
 | Supplier | Supplier name from folder |
 | PPWR compliant with heavy metals concentration limit | `yes` / `no` / `N/A` — sum of Pb, Cd, Hg, Cr6+ &lt; 100 mg |
 | PPWR SoC content | `yes` / `no` / `N/A` — presence of Substances of Concern |

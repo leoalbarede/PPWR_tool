@@ -85,6 +85,7 @@ PPWR_SECTIONS: List[Tuple[str, str]] = [
 
 CSV_COLUMNS = [
     "Supplier No.",
+    "Doc list",
     "Supplier",
     "PPWR compliant with heavy metals concentration limit",
     "PPWR SoC content",
@@ -98,6 +99,7 @@ CSV_COLUMNS = [
 # User-facing export (core columns only)
 CSV_COLUMNS_CORE = [
     "Supplier No.",
+    "Doc list",
     "Supplier",
     "PPWR compliant with heavy metals concentration limit",
     "PPWR SoC content",
@@ -123,6 +125,7 @@ class PdfFinding:
 
 @dataclass
 class SupplierFinding:
+    doc_list: str
     supplier_no: str
     supplier: str
     pdf_findings: List[PdfFinding] = field(default_factory=list)
@@ -144,28 +147,56 @@ def parse_supplier_folder(folder_name: str) -> Optional[Tuple[str, str]]:
     return supplier_no, match.group("supplier").strip()
 
 
-def discover_suppliers(docs_dir: str = DOCS_DIR) -> List[Tuple[str, str, List[str]]]:
-    """Return (supplier_no, supplier_name, pdf_paths) for each subfolder under docs/."""
+def _collect_pdfs(folder_path: str) -> List[str]:
+    return sorted(
+        os.path.join(folder_path, f)
+        for f in os.listdir(folder_path)
+        if f.lower().endswith(".pdf")
+    )
+
+
+def discover_suppliers(
+    docs_dir: str = DOCS_DIR,
+) -> List[Tuple[str, str, str, List[str]]]:
+    """
+    Return (doc_list, supplier_no, supplier_name, pdf_paths).
+
+    Supports nested layout docs/<Doc list>/<Supplier folder>/PDFs
+    and legacy flat layout docs/<Supplier folder>/PDFs.
+    """
     if not os.path.isdir(docs_dir):
         raise FileNotFoundError(f"Docs directory not found: {docs_dir}")
 
-    suppliers: List[Tuple[str, str, List[str]]] = []
+    suppliers: List[Tuple[str, str, str, List[str]]] = []
     for entry in sorted(os.listdir(docs_dir)):
         folder_path = os.path.join(docs_dir, entry)
         if not os.path.isdir(folder_path):
             continue
+
         parsed = parse_supplier_folder(entry)
-        if not parsed:
-            print(f"⚠️  Skipping folder (unexpected name): {entry}")
+        if parsed:
+            supplier_no, supplier_name = parsed
+            pdfs = _collect_pdfs(folder_path)
+            suppliers.append(("", entry.strip(), supplier_no, supplier_name, pdfs))
             continue
-        supplier_no, supplier_name = parsed
-        pdfs = sorted(
-            os.path.join(folder_path, f)
-            for f in os.listdir(folder_path)
-            if f.lower().endswith(".pdf")
-        )
-        suppliers.append((supplier_no, supplier_name, pdfs))
-    return suppliers
+
+        doc_list = entry.strip()
+        for sub_entry in sorted(os.listdir(folder_path)):
+            sub_path = os.path.join(folder_path, sub_entry)
+            if not os.path.isdir(sub_path):
+                continue
+            sub_parsed = parse_supplier_folder(sub_entry)
+            if not sub_parsed:
+                print(f"⚠️  Skipping folder (unexpected name): {doc_list}/{sub_entry}")
+                continue
+            supplier_no, supplier_name = sub_parsed
+            pdfs = _collect_pdfs(sub_path)
+            suppliers.append((doc_list, sub_entry.strip(), supplier_no, supplier_name, pdfs))
+
+    return [
+        (doc_list, supplier_no, supplier_name, pdfs)
+        for doc_list, _folder, supplier_no, supplier_name, pdfs in suppliers
+    ]
 
 
 def _normalize_answer(raw: str) -> str:
@@ -322,6 +353,7 @@ def _format_concentration(hm: PointFinding, soc: PointFinding, with_citations: b
 
 
 def aggregate_supplier(
+    doc_list: str,
     supplier_no: str,
     supplier: str,
     pdf_findings: List[PdfFinding],
@@ -337,6 +369,7 @@ def aggregate_supplier(
 
     return {
         "Supplier No.": supplier_no,
+        "Doc list": doc_list,
         "Supplier": supplier,
         "PPWR compliant with heavy metals concentration limit": hm.answer,
         "PPWR SoC content": soc.answer,
@@ -366,17 +399,21 @@ def run_audit(
         needle = supplier_filter.lower()
         suppliers = [
             s for s in suppliers
-            if needle in s[0].lower() or needle in s[1].lower()
+            if needle in s[0].lower()
+            or needle in s[1].lower()
+            or needle in s[2].lower()
         ]
 
     rows: List[Dict[str, str]] = []
-    for supplier_no, supplier_name, pdf_paths in suppliers:
-        print(f"\n{'=' * 60}\nSupplier: {supplier_name} ({supplier_no})")
+    for doc_list, supplier_no, supplier_name, pdf_paths in suppliers:
+        list_label = f" [{doc_list}]" if doc_list else ""
+        print(f"\n{'=' * 60}\nSupplier: {supplier_name} ({supplier_no}){list_label}")
         if not pdf_paths:
             print("  No PDFs found — row will be N/A.")
             rows.append(
                 {
                     "Supplier No.": supplier_no,
+                    "Doc list": doc_list,
                     "Supplier": supplier_name,
                     "PPWR compliant with heavy metals concentration limit": "N/A",
                     "PPWR SoC content": "N/A",
@@ -398,6 +435,7 @@ def run_audit(
                 print(f"  ❌ Error on {pdf_path}: {exc}")
 
         row = aggregate_supplier(
+            doc_list,
             supplier_no,
             supplier_name,
             pdf_findings,
@@ -452,8 +490,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.list_suppliers:
-        for supplier_no, supplier_name, pdfs in discover_suppliers(args.docs_dir):
-            print(f"{supplier_no} | {supplier_name} | {len(pdfs)} PDF(s)")
+        for doc_list, supplier_no, supplier_name, pdfs in discover_suppliers(args.docs_dir):
+            label = f"{doc_list} | " if doc_list else ""
+            print(f"{label}{supplier_no} | {supplier_name} | {len(pdfs)} PDF(s)")
         return
 
     run_audit(

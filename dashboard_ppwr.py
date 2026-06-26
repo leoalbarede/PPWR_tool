@@ -37,6 +37,24 @@ CHECK_DISPLAY: Dict[str, str] = {
 COL_HEAVY_METALS = "PPWR compliant with heavy metals concentration limit"
 COL_SOC = "PPWR SoC content"
 COL_CONCENTRATION = "Concentration"
+COL_DOC_LIST = "Doc list"
+
+def _row_doc_list(row: pd.Series) -> str:
+    if COL_DOC_LIST not in row.index:
+        return ""
+    val = row.get(COL_DOC_LIST, "")
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    return str(val).strip()
+
+
+def _matrix_group_cols(df: pd.DataFrame) -> List[str]:
+    cols = ["Supplier No."]
+    if COL_DOC_LIST in df.columns:
+        cols.append(COL_DOC_LIST)
+    cols.append("Supplier")
+    return cols
+
 
 CHECK_TO_COLUMN: Dict[str, str] = {
     "Heavy metals": COL_HEAVY_METALS,
@@ -236,11 +254,13 @@ def build_detail_rows(df: pd.DataFrame) -> pd.DataFrame:
     for _, row in df.iterrows():
         supplier_no = str(row.get("Supplier No.", "")).strip()
         supplier = str(row.get("Supplier", "")).strip() or supplier_no
+        doc_list = _row_doc_list(row)
         for check in CHECK_ORDER:
             result = resolve_check(row, check)
             rows.append(
                 {
                     "Supplier No.": supplier_no,
+                    "Doc list": doc_list,
                     "Supplier": supplier,
                     "Check": CHECK_DISPLAY[check],
                     "Check_key": check,
@@ -344,14 +364,17 @@ def main() -> None:
 
     st.subheader("Matrix — Supplier × check")
     matrix_rows: List[Dict] = []
-    for (supplier_no, supplier), group in detail.groupby(["Supplier No.", "Supplier"], sort=False):
-        row: Dict = {"Supplier No.": supplier_no, "Supplier": supplier}
+    group_cols = _matrix_group_cols(df)
+    for keys, group in detail.groupby(group_cols, sort=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row: Dict = dict(zip(group_cols, keys))
         for check in CHECK_ORDER:
             rec = group[group["Check_key"] == check].iloc[0]
             row[CHECK_DISPLAY[check]] = rec["Matrix_cell"]
         matrix_rows.append(row)
     matrix_df = pd.DataFrame(matrix_rows)
-    matrix_display_cols = [CHECK_DISPLAY[c] for c in CHECK_ORDER]
+    matrix_display_cols = group_cols + [CHECK_DISPLAY[c] for c in CHECK_ORDER]
 
     def _style_matrix(df_in: pd.DataFrame) -> pd.DataFrame:
         styled = df_in.style
@@ -366,18 +389,24 @@ def main() -> None:
     st.dataframe(_style_matrix(matrix_df), use_container_width=True, hide_index=True)
 
     st.subheader("Details by supplier")
-    supplier_options = [
-        f"{s} ({n})"
-        for s, n in sorted(
-            detail[["Supplier", "Supplier No."]].drop_duplicates().values.tolist()
-        )
-    ]
+    picker_cols = ["Supplier", "Supplier No."]
+    if COL_DOC_LIST in df.columns:
+        picker_cols = [COL_DOC_LIST] + picker_cols
+    picker_df = detail[picker_cols].drop_duplicates().sort_values(picker_cols)
+    supplier_options: List[str] = []
+    for vals in picker_df.values.tolist():
+        if len(vals) == 3:
+            doc_list, supplier, supplier_no = vals
+            supplier_options.append(f"{doc_list} — {supplier} ({supplier_no})")
+        else:
+            supplier, supplier_no = vals
+            supplier_options.append(f"{supplier} ({supplier_no})")
     pick_label = st.selectbox("Select supplier", options=supplier_options, index=0)
-    pick_supplier = pick_label.rsplit(" (", 1)[0]
-    pick_no = pick_label.rsplit(" (", 1)[1].rstrip(")")
-    sub = detail[
-        (detail["Supplier"] == pick_supplier) & (detail["Supplier No."] == pick_no)
-    ].copy()
+    pick_idx = supplier_options.index(pick_label)
+    picked = picker_df.iloc[pick_idx]
+    sub = detail.copy()
+    for col in picker_cols:
+        sub = sub[sub[col].astype(str) == str(picked[col])]
 
     show = sub[
         [
@@ -403,20 +432,17 @@ def main() -> None:
     )
 
     with st.expander("Show all supplier × check rows (long table)"):
-        long_table = detail.sort_values(["Supplier", "Check"]).copy()
+        long_table = detail.sort_values(group_cols + ["Check"]).copy()
         long_table["Concentration"] = long_table["Concentration_display"]
+        long_cols = group_cols + [
+            "Check",
+            "Answer_display",
+            "Concentration",
+            "Evidence",
+            "Source document",
+        ]
         st.dataframe(
-            long_table[
-                [
-                    "Supplier No.",
-                    "Supplier",
-                    "Check",
-                    "Answer_display",
-                    "Concentration",
-                    "Evidence",
-                    "Source document",
-                ]
-            ].rename(columns={"Answer_display": "Answer"}),
+            long_table[long_cols].rename(columns={"Answer_display": "Answer"}),
             use_container_width=True,
             hide_index=True,
         )
