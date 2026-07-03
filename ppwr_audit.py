@@ -22,7 +22,9 @@ from evidence_validator import (
     CHECK_PFAS,
     CHECK_SOC,
     CHECK_SVHC,
+    correct_inverted_raw_answer,
     dedupe_findings,
+    recover_pfas_from_markdown,
     validate_point_finding,
 )
 
@@ -94,12 +96,16 @@ PPWR_SECTIONS: List[Tuple[str, str]] = [
         """
 3. PFAS (per- and polyfluoroalkyl substances) in packaging materials: Is PFAS presence or concentration
    explicitly mentioned? EU PPWR limits: <25 µg/kg per individual PFAS, <250 µg/kg sum of targeted PFAS,
-   <50 mg/kg total PFAS including polymeric PFAS.
-   Answer YES if PFAS are present or declared above these limits, NO if explicitly absent, not detected,
-   or declared below limits, N/A if PFAS are not mentioned at all.
-   Answer N/A if the only quote describes PPWR/legal requirements, not the supplier's own material.
+   <50 mg/kg total PFAS including polymeric PFAS (total fluorine).
+   SEMANTICS (inverted — read carefully):
+   - Answer YES only if PFAS are present, detected, or declared ABOVE regulatory limits (non-compliant).
+   - Answer NO if the supplier explicitly states PFAS are absent, not detected, below limits, or that
+     PFAS limits/requirements are MET (e.g. "limit for PFAS … is met", "requirements for PFAS … are met",
+     "PFAS are not used", TF/TOF analysis confirms compliance).
+   - Answer N/A if PFAS are not mentioned at all.
+   Answer N/A if the only quote describes PPWR/legal requirements only, not the supplier's own material.
    If YES or NO with quantitative values, report concentrations exactly as written.
-   Evidence must mention PFAS, perfluoro, or polyfluoro — NOT heavy metals or generic SoC alone.
+   Evidence must mention PFAS, perfluoro, polyfluoro, total fluorine, or Article 5.5 — NOT heavy metals or generic SoC alone.
 """.strip(),
     ),
     (
@@ -119,6 +125,7 @@ PPWR_SECTIONS: List[Tuple[str, str]] = [
 CSV_COLUMNS = [
     "Supplier No.",
     "Doc list",
+    "Supplier folder",
     "Supplier",
     "PPWR compliant with heavy metals concentration limit",
     "PPWR SoC content",
@@ -139,6 +146,7 @@ CSV_COLUMNS = [
 CSV_COLUMNS_CORE = [
     "Supplier No.",
     "Doc list",
+    "Supplier folder",
     "Supplier",
     "PPWR compliant with heavy metals concentration limit",
     "PPWR SoC content",
@@ -200,9 +208,9 @@ def _collect_pdfs(folder_path: str) -> List[str]:
 
 def discover_suppliers(
     docs_dir: str = DOCS_DIR,
-) -> List[Tuple[str, str, str, List[str]]]:
+) -> List[Tuple[str, str, str, str, List[str]]]:
     """
-    Return (doc_list, supplier_no, supplier_name, pdf_paths).
+    Return (doc_list, supplier_folder, supplier_no, supplier_name, pdf_paths).
 
     Supports nested layout docs/<Doc list>/<Supplier folder>/PDFs
     and legacy flat layout docs/<Supplier folder>/PDFs.
@@ -210,7 +218,7 @@ def discover_suppliers(
     if not os.path.isdir(docs_dir):
         raise FileNotFoundError(f"Docs directory not found: {docs_dir}")
 
-    suppliers: List[Tuple[str, str, str, List[str]]] = []
+    suppliers: List[Tuple[str, str, str, str, List[str]]] = []
     for entry in sorted(os.listdir(docs_dir)):
         folder_path = os.path.join(docs_dir, entry)
         if not os.path.isdir(folder_path):
@@ -236,10 +244,7 @@ def discover_suppliers(
             pdfs = _collect_pdfs(sub_path)
             suppliers.append((doc_list, sub_entry.strip(), supplier_no, supplier_name, pdfs))
 
-    return [
-        (doc_list, supplier_no, supplier_name, pdfs)
-        for doc_list, _folder, supplier_no, supplier_name, pdfs in suppliers
-    ]
+    return suppliers
 
 
 def _normalize_answer(raw: str) -> str:
@@ -343,6 +348,10 @@ def _validate_pdf_finding(finding: PdfFinding, source_markdown: str) -> PdfFindi
     )
     finding.soc = validate_point_finding(finding.soc, source_markdown, CHECK_SOC)
     finding.pfas = validate_point_finding(finding.pfas, source_markdown, CHECK_PFAS)
+    if finding.pfas.answer == "N/A":
+        recovered = recover_pfas_from_markdown(source_markdown, finding.source_file)
+        if recovered is not None:
+            finding.pfas = validate_point_finding(recovered, source_markdown, CHECK_PFAS)
     finding.svhc = validate_point_finding(finding.svhc, source_markdown, CHECK_SVHC)
     dedupe_findings(
         {
@@ -414,6 +423,7 @@ def _format_concentration(findings: Dict[str, PointFinding], with_citations: boo
 
 def aggregate_supplier(
     doc_list: str,
+    supplier_folder: str,
     supplier_no: str,
     supplier: str,
     pdf_findings: List[PdfFinding],
@@ -434,13 +444,16 @@ def aggregate_supplier(
         with_citations=with_citations_in_concentration,
     )
 
+    pfas_answer = correct_inverted_raw_answer(CHECK_PFAS, pfas.answer, pfas.evidence)
+
     return {
         "Supplier No.": supplier_no,
         "Doc list": doc_list,
+        "Supplier folder": supplier_folder,
         "Supplier": supplier,
         "PPWR compliant with heavy metals concentration limit": hm.answer,
         "PPWR SoC content": soc.answer,
-        "PPWR PFAS content": pfas.answer,
+        "PPWR PFAS content": pfas_answer,
         "PPWR SVHC content": svhc.answer,
         "Concentration": concentration,
         "Heavy metals evidence": hm.evidence,
@@ -475,10 +488,11 @@ def run_audit(
             if needle in s[0].lower()
             or needle in s[1].lower()
             or needle in s[2].lower()
+            or needle in s[3].lower()
         ]
 
     rows: List[Dict[str, str]] = []
-    for doc_list, supplier_no, supplier_name, pdf_paths in suppliers:
+    for doc_list, supplier_folder, supplier_no, supplier_name, pdf_paths in suppliers:
         list_label = f" [{doc_list}]" if doc_list else ""
         print(f"\n{'=' * 60}\nSupplier: {supplier_name} ({supplier_no}){list_label}")
         if not pdf_paths:
@@ -487,6 +501,7 @@ def run_audit(
                 {
                     "Supplier No.": supplier_no,
                     "Doc list": doc_list,
+                    "Supplier folder": supplier_folder,
                     "Supplier": supplier_name,
                     "PPWR compliant with heavy metals concentration limit": "N/A",
                     "PPWR SoC content": "N/A",
@@ -515,6 +530,7 @@ def run_audit(
 
         row = aggregate_supplier(
             doc_list,
+            supplier_folder,
             supplier_no,
             supplier_name,
             pdf_findings,
@@ -570,9 +586,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.list_suppliers:
-        for doc_list, supplier_no, supplier_name, pdfs in discover_suppliers(args.docs_dir):
+        for doc_list, supplier_folder, supplier_no, supplier_name, pdfs in discover_suppliers(args.docs_dir):
             label = f"{doc_list} | " if doc_list else ""
-            print(f"{label}{supplier_no} | {supplier_name} | {len(pdfs)} PDF(s)")
+            print(f"{label}{supplier_folder} | {supplier_no} | {supplier_name} | {len(pdfs)} PDF(s)")
         return
 
     run_audit(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 MIN_EVIDENCE_CHARS = 15
@@ -29,6 +30,12 @@ __all__ = [
     "normalize_text_for_match",
     "reject_shared_evidence",
     "soc_evidence_duplicates_heavy_metals",
+    "correct_inverted_check_finding",
+    "correct_inverted_raw_answer",
+    "recover_pfas_from_markdown",
+    "evidence_indicates_compliant",
+    "evidence_indicates_noncompliant",
+    "INVERTED_CHECKS",
     "validate_point_finding",
 ]
 
@@ -71,11 +78,46 @@ _PFAS_TOPIC_RE = re.compile(
     r"perfluoro|"
     r"polyfluoro|"
     r"fluorinated\s+alkyl|"
+    r"total\s+fluorine|"
+    r"article\s*5[\.\s]*5?|"
+    r"\btf\b|\btof\b|"
     r"25\s*(?:µg|ug)/kg|"
     r"250\s*(?:µg|ug)/kg|"
-    r"50\s*mg/kg.*pfas|"
+    r"50\s*(?:mg/kg|ppm).*(?:pfas|fluorine)|"
     r"total\s+pfas|"
     r"polymeric\s+pfas"
+    r")",
+    re.IGNORECASE,
+)
+
+# PFAS / SoC / SVHC: CSV "yes" = substance detected or above limit; "no" = compliant / absent.
+INVERTED_CHECKS = frozenset({CHECK_SOC, CHECK_PFAS, CHECK_SVHC})
+
+_PFAS_COMPLIANT_EVIDENCE_RE = re.compile(
+    r"(?:"
+    r"limit(?:s)?\s+(?:for\s+)?pfas.{0,120}?(?:is|are)\s+met|"
+    r"specific\s+limit\s+for\s+pfas.{0,120}?(?:is|are)\s+met|"
+    r"requirements?\s+for\s+pfas.{0,150}?(?:is|are)\s+met|"
+    r"requirements?\s+as\s+set\s+out\s+in\s+article\s*5\.?5?.{0,80}?(?:is|are)\s+met|"
+    r"pfas.{0,120}?(?:is|are)\s+met|"
+    r"pfas\s+are\s+not\s+used|"
+    r"no\s+pfas|"
+    r"(?:pfas|fluorine).{0,80}?not\s+detected|"
+    r"(?:pfas|fluorine).{0,80}?not\s+present|"
+    r"(?:pfas|fluorine).{0,80}?below\s+(?:the\s+)?limit|"
+    r"total\s+fluorine.{0,80}?(?:met|within)|"
+    r"analytical\s+investigations?\s+showing\s+that.{0,120}?(?:is|are)\s+met"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_PFAS_NONCOMPLIANT_EVIDENCE_RE = re.compile(
+    r"(?:"
+    r"above\s+(?:the\s+)?limit|"
+    r"exceeds?\s+(?:the\s+)?limit|"
+    r"non-?compliant|"
+    r"detected\s+above|"
+    r"present\s+above"
     r")",
     re.IGNORECASE,
 )
@@ -126,7 +168,11 @@ _MATERIAL_DECLARATION_RE = re.compile(
     r"above-mentioned\s+material|"
     r"packaging\s+materials?\s+(?:do|shall|does)|"
     r"neither\s+in\s+our\s+production|"
-    r"combined\s+total\s+amount"
+    r"combined\s+total\s+amount|"
+    r"has\s+conducted|"
+    r"analytical\s+investigations|"
+    r"limit(?:s)?\s+(?:for\s+)?pfas.*(?:is|are)\s+met|"
+    r"requirements?.*(?:is|are)\s+met"
     r")",
     re.IGNORECASE,
 )
@@ -247,6 +293,155 @@ def evidence_duplicates_prior_check(
     return False
 
 
+def evidence_indicates_compliant(check: str, evidence: str) -> bool:
+    if check == CHECK_PFAS:
+        if not _PFAS_TOPIC_RE.search(evidence):
+            return False
+        return bool(_PFAS_COMPLIANT_EVIDENCE_RE.search(evidence))
+    return False
+
+
+def evidence_indicates_noncompliant(check: str, evidence: str) -> bool:
+    if check == CHECK_PFAS:
+        return bool(_PFAS_NONCOMPLIANT_EVIDENCE_RE.search(evidence))
+    return False
+
+
+def correct_inverted_check_finding(finding, check: str):
+    """
+    Fix misclassified inverted checks (PFAS/SoC/SVHC).
+
+    CSV yes = detected / above limit; CSV no = compliant / absent.
+    """
+    if check not in INVERTED_CHECKS:
+        return finding
+    if finding.answer not in ("yes", "no") or finding.evidence in ("", "NONE"):
+        return finding
+    compliant = evidence_indicates_compliant(check, finding.evidence)
+    noncompliant = evidence_indicates_noncompliant(check, finding.evidence)
+    if finding.answer == "yes" and compliant and not noncompliant:
+        finding.answer = "no"
+        note = "Corrected: evidence indicates compliance (limit met / not detected)."
+        finding.notes = note if finding.notes in ("", "NONE") else f"{finding.notes} {note}"
+    elif finding.answer == "no" and noncompliant and not compliant:
+        finding.answer = "yes"
+        note = "Corrected: evidence indicates non-compliance."
+        finding.notes = note if finding.notes in ("", "NONE") else f"{finding.notes} {note}"
+    return finding
+
+
+def correct_inverted_raw_answer(check: str, raw_answer: str, evidence: str) -> str:
+    """Dashboard/CSV post-correction for inverted checks."""
+    if check not in INVERTED_CHECKS:
+        return raw_answer
+    if raw_answer not in ("yes", "no") or not evidence or evidence in ("", "NONE", "—"):
+        return raw_answer
+    compliant = evidence_indicates_compliant(check, evidence)
+    noncompliant = evidence_indicates_noncompliant(check, evidence)
+    if raw_answer == "yes" and compliant and not noncompliant:
+        return "no"
+    if raw_answer == "no" and noncompliant and not compliant:
+        return "yes"
+    return raw_answer
+
+
+def recover_pfas_from_markdown(markdown: str, source_file: str = ""):
+    """Extract a PFAS finding when the LLM returned N/A but source text supports it."""
+    if not markdown:
+        return None
+
+    def _quote_around(match: re.Match) -> str:
+        start = max(0, match.start() - 120)
+        end = min(len(markdown), match.end() + 180)
+        return re.sub(r"\s+", " ", markdown[start:end]).strip()[:300]
+
+    compliant_hits: List[Tuple[int, str]] = []
+    noncompliant_hits: List[str] = []
+
+    def _score_compliant(quote: str) -> int:
+        q = quote.lower()
+        score = 0
+        if "requirements for pfas" in q and "are met" in q:
+            score += 20
+        if "limit for pfas" in q and "is met" in q:
+            score += 20
+        if "confirm" in q and "pfas" in q:
+            score += 10
+        if "article 5" in q:
+            score += 5
+        score -= max(0, len(quote) - 200)
+        return score
+
+    for match in _PFAS_COMPLIANT_EVIDENCE_RE.finditer(markdown):
+        quote = _quote_around(match)
+        if (
+            len(quote) >= MIN_EVIDENCE_CHARS
+            and _PFAS_TOPIC_RE.search(quote)
+            and evidence_in_source(quote, markdown)
+        ):
+            compliant_hits.append((_score_compliant(quote), quote))
+
+    for match in _PFAS_NONCOMPLIANT_EVIDENCE_RE.finditer(markdown):
+        quote = _quote_around(match)
+        if (
+            len(quote) >= MIN_EVIDENCE_CHARS
+            and _PFAS_TOPIC_RE.search(quote)
+            and evidence_in_source(quote, markdown)
+        ):
+            noncompliant_hits.append(quote)
+
+    if compliant_hits:
+        compliant_hits.sort(key=lambda x: x[0], reverse=True)
+        best = compliant_hits[0][1]
+        return SimpleNamespace(
+            answer="no",
+            evidence=best,
+            concentration="N/A",
+            notes="Recovered from source text (PFAS compliance statement).",
+            source_document=source_file,
+        )
+    if noncompliant_hits:
+        return SimpleNamespace(
+            answer="yes",
+            evidence=noncompliant_hits[0],
+            concentration="N/A",
+            notes="Recovered from source text.",
+            source_document=source_file,
+        )
+
+    # Fallback: sentence chunks (legacy path for cleanly formatted text).
+    candidates: List[Tuple[str, str]] = []
+    for chunk in re.split(r"(?<=[.!?])\s+|\n+", markdown):
+        text = chunk.strip()
+        if len(text) < MIN_EVIDENCE_CHARS or not _PFAS_TOPIC_RE.search(text):
+            continue
+        if not evidence_in_source(text[:300], markdown):
+            continue
+        if _PFAS_NONCOMPLIANT_EVIDENCE_RE.search(text):
+            candidates.append(("yes", text[:300]))
+        elif _PFAS_COMPLIANT_EVIDENCE_RE.search(text):
+            candidates.append(("no", text[:300]))
+    if not candidates:
+        return None
+    for answer, quote in candidates:
+        if answer == "no":
+            return SimpleNamespace(
+                answer="no",
+                evidence=quote,
+                concentration="N/A",
+                notes="Recovered from source text (PFAS compliance statement).",
+                source_document=source_file,
+            )
+    answer, quote = candidates[0]
+    return SimpleNamespace(
+        answer=answer,
+        evidence=quote,
+        concentration="N/A",
+        notes="Recovered from source text.",
+        source_document=source_file,
+    )
+
+
 def is_regulatory_boilerplate_only(evidence: str) -> bool:
     """True when the quote looks like PPWR/legal text only, not a supplier material statement."""
     if not evidence or evidence.strip().upper() == "NONE":
@@ -286,7 +481,7 @@ def validate_point_finding(
             "Quote describes legal requirements only, not supplier material.",
         )
         return finding
-    return finding
+    return correct_inverted_check_finding(finding, check) if check else finding
 
 
 # Backward compatibility

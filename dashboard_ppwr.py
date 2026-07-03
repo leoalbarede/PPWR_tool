@@ -18,6 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from evidence_validator import (
+    correct_inverted_raw_answer,
     evidence_duplicates_prior_check,
     evidence_matches_check,
     is_regulatory_boilerplate_only,
@@ -43,6 +44,7 @@ COL_PFAS = "PPWR PFAS content"
 COL_SVHC = "PPWR SVHC content"
 COL_CONCENTRATION = "Concentration"
 COL_DOC_LIST = "Doc list"
+COL_SUPPLIER_FOLDER = "Supplier folder"
 
 CHECK_TO_COLUMN: Dict[str, str] = {
     "Heavy metals": COL_HEAVY_METALS,
@@ -76,9 +78,12 @@ def _row_doc_list(row: pd.Series) -> str:
 
 
 def _matrix_group_cols(df: pd.DataFrame) -> List[str]:
+    """One matrix row per CSV row — include folder when present to disambiguate duplicates."""
     cols = ["Supplier No."]
     if COL_DOC_LIST in df.columns:
         cols.append(COL_DOC_LIST)
+    if COL_SUPPLIER_FOLDER in df.columns:
+        cols.append(COL_SUPPLIER_FOLDER)
     cols.append("Supplier")
     return cols
 
@@ -243,6 +248,7 @@ def resolve_check(row: pd.Series, check: str) -> CheckResult:
     concentration, evidence, source = _row_evidence(row, check)
     answer = enforce_evidence(row.get(col), evidence, check=check)
     if answer in ("yes", "no") and evidence_ok(evidence):
+        answer = correct_inverted_raw_answer(CHECK_TO_VALIDATOR[check], answer, evidence)
         for prior_check in CHECK_ORDER:
             if prior_check == check:
                 break
@@ -277,17 +283,14 @@ def resolve_check(row: pd.Series, check: str) -> CheckResult:
 
 def build_detail_rows(df: pd.DataFrame) -> pd.DataFrame:
     rows: List[Dict] = []
+    row_cols = _matrix_group_cols(df)
     for _, row in df.iterrows():
-        supplier_no = str(row.get("Supplier No.", "")).strip()
-        supplier = str(row.get("Supplier", "")).strip() or supplier_no
-        doc_list = _row_doc_list(row)
+        base = {col: str(row.get(col, "")).strip() for col in row_cols}
         for check in CHECK_ORDER:
             result = resolve_check(row, check)
             rows.append(
                 {
-                    "Supplier No.": supplier_no,
-                    "Doc list": doc_list,
-                    "Supplier": supplier,
+                    **base,
                     "Check": CHECK_DISPLAY[check],
                     "Check_key": check,
                     "Answer": result.answer,
@@ -401,14 +404,11 @@ def main() -> None:
     st.subheader("Matrix — Supplier × check")
     matrix_rows: List[Dict] = []
     group_cols = _matrix_group_cols(df)
-    for keys, group in detail.groupby(group_cols, sort=False):
-        if not isinstance(keys, tuple):
-            keys = (keys,)
-        row: Dict = dict(zip(group_cols, keys))
+    for _, row in df.iterrows():
+        out = {col: str(row.get(col, "")).strip() for col in group_cols}
         for check in CHECK_ORDER:
-            rec = group[group["Check_key"] == check].iloc[0]
-            row[CHECK_DISPLAY[check]] = rec["Matrix_cell"]
-        matrix_rows.append(row)
+            out[CHECK_DISPLAY[check]] = resolve_check(row, check).matrix_cell
+        matrix_rows.append(out)
     matrix_df = pd.DataFrame(matrix_rows)
     matrix_display_cols = group_cols + [CHECK_DISPLAY[c] for c in CHECK_ORDER]
     check_cols = [CHECK_DISPLAY[c] for c in CHECK_ORDER]
@@ -426,18 +426,12 @@ def main() -> None:
     st.dataframe(_style_matrix(matrix_df), use_container_width=True, hide_index=True)
 
     st.subheader("Details by supplier")
-    picker_cols = ["Supplier", "Supplier No."]
-    if COL_DOC_LIST in df.columns:
-        picker_cols = [COL_DOC_LIST] + picker_cols
-    picker_df = detail[picker_cols].drop_duplicates().sort_values(picker_cols)
+    picker_cols = list(_matrix_group_cols(df))
+    picker_df = df[picker_cols].drop_duplicates().sort_values(picker_cols)
     supplier_options: List[str] = []
     for vals in picker_df.values.tolist():
-        if len(vals) == 3:
-            doc_list, supplier, supplier_no = vals
-            supplier_options.append(f"{doc_list} — {supplier} ({supplier_no})")
-        else:
-            supplier, supplier_no = vals
-            supplier_options.append(f"{supplier} ({supplier_no})")
+        parts = [str(v).strip() for v in vals if str(v).strip()]
+        supplier_options.append(" — ".join(parts))
     pick_label = st.selectbox("Select supplier", options=supplier_options, index=0)
     pick_idx = supplier_options.index(pick_label)
     picked = picker_df.iloc[pick_idx]
