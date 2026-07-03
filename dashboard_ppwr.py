@@ -371,7 +371,7 @@ def main() -> None:
         "- `No` = one or more SoC detected\n"
         "- `N/A` = not mentioned in documents\n\n"
         "**PFAS compliance**\n"
-        "- `Yes` = no PFAS detected (below EU limits: 25 µg/kg individual, 250 µg/kg sum, 50 mg/kg total)\n"
+        "- `Yes` = PFAS compliant: not detected, below limits, or supplier states the limit/requirement **is met**\n"
         "- `No` = PFAS detected above regulatory limits\n"
         "- `N/A` = not mentioned in documents\n\n"
         "**SVHC conformity**\n"

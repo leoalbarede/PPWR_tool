@@ -24,6 +24,7 @@ from evidence_validator import (
     CHECK_SVHC,
     correct_inverted_raw_answer,
     dedupe_findings,
+    evidence_declarant_mismatch,
     recover_pfas_from_markdown,
     validate_point_finding,
 )
@@ -342,17 +343,23 @@ def parse_rag_answer(answer_text: str, source_file: str) -> PdfFinding:
     return result
 
 
-def _validate_pdf_finding(finding: PdfFinding, source_markdown: str) -> PdfFinding:
+def _validate_pdf_finding(
+    finding: PdfFinding,
+    source_markdown: str,
+    supplier_name: Optional[str] = None,
+) -> PdfFinding:
     finding.heavy_metals = validate_point_finding(
-        finding.heavy_metals, source_markdown, CHECK_HEAVY_METALS
+        finding.heavy_metals, source_markdown, CHECK_HEAVY_METALS, supplier_name
     )
-    finding.soc = validate_point_finding(finding.soc, source_markdown, CHECK_SOC)
-    finding.pfas = validate_point_finding(finding.pfas, source_markdown, CHECK_PFAS)
+    finding.soc = validate_point_finding(finding.soc, source_markdown, CHECK_SOC, supplier_name)
+    finding.pfas = validate_point_finding(finding.pfas, source_markdown, CHECK_PFAS, supplier_name)
     if finding.pfas.answer == "N/A":
         recovered = recover_pfas_from_markdown(source_markdown, finding.source_file)
         if recovered is not None:
-            finding.pfas = validate_point_finding(recovered, source_markdown, CHECK_PFAS)
-    finding.svhc = validate_point_finding(finding.svhc, source_markdown, CHECK_SVHC)
+            finding.pfas = validate_point_finding(
+                recovered, source_markdown, CHECK_PFAS, supplier_name
+            )
+    finding.svhc = validate_point_finding(finding.svhc, source_markdown, CHECK_SVHC, supplier_name)
     dedupe_findings(
         {
             CHECK_HEAVY_METALS: finding.heavy_metals,
@@ -364,7 +371,12 @@ def _validate_pdf_finding(finding: PdfFinding, source_markdown: str) -> PdfFindi
     return finding
 
 
-def analyze_pdf(pdf_path: str, api_key: str, k: int = 5) -> PdfFinding:
+def analyze_pdf(
+    pdf_path: str,
+    api_key: str,
+    k: int = 5,
+    supplier_name: Optional[str] = None,
+) -> PdfFinding:
     source_file = os.path.basename(pdf_path)
     instruction = (
         f"{PPWR_INSTRUCTION}\n\n"
@@ -380,7 +392,19 @@ def analyze_pdf(pdf_path: str, api_key: str, k: int = 5) -> PdfFinding:
     )
     finding = parse_rag_answer(rag.get("answer", ""), source_file)
     source_markdown = get_document_markdown(pdf_path)
-    return _validate_pdf_finding(finding, source_markdown)
+    return _validate_pdf_finding(finding, source_markdown, supplier_name)
+
+
+def _reject_third_party_finding(
+    finding: PointFinding,
+    supplier_name: str,
+    source_markdown: str = "",
+) -> PointFinding:
+    if finding.answer in ("yes", "no") and evidence_declarant_mismatch(
+        finding.evidence, supplier_name, source_markdown
+    ):
+        return PointFinding()
+    return finding
 
 
 def _has_evidence(finding: PointFinding) -> bool:
@@ -434,10 +458,10 @@ def aggregate_supplier(
     pfas_list = [p.pfas for p in pdf_findings]
     svhc_list = [p.svhc for p in pdf_findings]
 
-    hm = _pick_best(hm_list)
-    soc = _pick_best(soc_list)
-    pfas = _pick_best(pfas_list)
-    svhc = _pick_best(svhc_list)
+    hm = _reject_third_party_finding(_pick_best(hm_list), supplier)
+    soc = _reject_third_party_finding(_pick_best(soc_list), supplier)
+    pfas = _reject_third_party_finding(_pick_best(pfas_list), supplier)
+    svhc = _reject_third_party_finding(_pick_best(svhc_list), supplier)
 
     concentration = _format_concentration(
         {"heavy_metals": hm, "soc": soc, "pfas": pfas, "svhc": svhc},
@@ -524,7 +548,7 @@ def run_audit(
         for pdf_path in pdf_paths:
             print(f"  Analyzing: {os.path.basename(pdf_path)}")
             try:
-                pdf_findings.append(analyze_pdf(pdf_path, key, k=k))
+                pdf_findings.append(analyze_pdf(pdf_path, key, k=k, supplier_name=supplier_name))
             except Exception as exc:
                 print(f"  ❌ Error on {pdf_path}: {exc}")
 

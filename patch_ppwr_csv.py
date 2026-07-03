@@ -19,9 +19,17 @@ from pypdf import PdfReader
 from evidence_validator import (
     CHECK_PFAS,
     correct_inverted_raw_answer,
+    enrich_pass_through_pfas_evidence,
+    evidence_declarant_mismatch,
     evidence_indicates_compliant,
+    evidence_matches_check,
     recover_pfas_from_markdown,
     validate_point_finding,
+)
+
+_PASS_THROUGH_DECLARATION_RE = re.compile(
+    r"present\s+declaration\s+is\s+valid\s+for\s+material",
+    re.IGNORECASE,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,20 +155,11 @@ def patch_row_pfas(
 ) -> None:
     pfas_ev = (row.get("PFAS evidence") or "").strip()
     pfas_raw = (row.get("PPWR PFAS content") or "N/A").strip()
-    if pfas_ev and pfas_ev not in ("NONE", "nan"):
-        row["PPWR PFAS content"] = correct_inverted_raw_answer(CHECK_PFAS, pfas_raw, pfas_ev)
-
-    needs_recovery = row.get("PPWR PFAS content", "N/A") in ("N/A", "", "nan")
-    if not needs_recovery and row.get("PPWR PFAS content") == "no":
-        needs_recovery = not evidence_indicates_compliant(CHECK_PFAS, pfas_ev)
-
-    if not needs_recovery:
-        return
+    sup_name = (row.get("Supplier") or "").strip()
 
     doc_list = row.get("Doc list", "")
     folder = row.get("Supplier folder", "")
     sup_no = row.get("Supplier No.", "")
-    sup_name = row.get("Supplier", "")
     pdfs = pdf_lookup.get((doc_list, folder, sup_no, sup_name), [])
     if not pdfs:
         for key, paths in pdf_lookup.items():
@@ -169,12 +168,52 @@ def patch_row_pfas(
                 row["Supplier folder"] = key[1]
                 break
 
+    if pdfs and sup_name:
+        for pdf_path in pdfs:
+            markdown = pdf_to_text(pdf_path)
+            if not _PASS_THROUGH_DECLARATION_RE.search(markdown):
+                continue
+            candidate = enrich_pass_through_pfas_evidence(
+                pfas_ev if pfas_ev not in ("NONE", "nan", "") else "NONE",
+                markdown,
+                sup_name,
+            )
+            needs_better_quote = (
+                not pfas_ev
+                or pfas_ev in ("NONE", "nan")
+                or not evidence_matches_check(pfas_ev, CHECK_PFAS)
+                or (
+                    candidate
+                    and candidate not in ("NONE", "nan", "")
+                    and candidate != pfas_ev
+                )
+            )
+            if needs_better_quote:
+                enriched = candidate
+                if enriched and enriched not in ("NONE", "nan", ""):
+                    pfas_ev = enriched
+                    row["PFAS evidence"] = enriched
+                    row["PFAS source document"] = os.path.basename(pdf_path)
+                    break
+
+    if pfas_ev and pfas_ev not in ("NONE", "nan"):
+        markdown_for_check = ""
+        if pdfs:
+            markdown_for_check = pdf_to_text(pdfs[0])
+        if sup_name and evidence_declarant_mismatch(pfas_ev, sup_name, markdown_for_check):
+            row["PPWR PFAS content"] = "N/A"
+            row["PFAS evidence"] = "NONE"
+            row["PFAS source document"] = ""
+            return
+        row["PPWR PFAS content"] = correct_inverted_raw_answer(CHECK_PFAS, pfas_raw, pfas_ev)
+        return
+
     for pdf_path in pdfs:
         markdown = pdf_to_text(pdf_path)
         recovered = recover_pfas_from_markdown(markdown, os.path.basename(pdf_path))
         if recovered is None:
             continue
-        validated = validate_point_finding(recovered, markdown, CHECK_PFAS)
+        validated = validate_point_finding(recovered, markdown, CHECK_PFAS, sup_name)
         if validated.answer not in ("yes", "no"):
             continue
         row["PPWR PFAS content"] = correct_inverted_raw_answer(

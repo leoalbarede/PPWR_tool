@@ -36,6 +36,7 @@ __all__ = [
     "evidence_indicates_compliant",
     "evidence_indicates_noncompliant",
     "INVERTED_CHECKS",
+    "evidence_declarant_mismatch",
     "validate_point_finding",
 ]
 
@@ -442,6 +443,155 @@ def recover_pfas_from_markdown(markdown: str, source_file: str = ""):
     )
 
 
+_DECLARANT_ACTION_RE = re.compile(
+    r"(?P<subject>[A-Z][A-Za-z0-9&.'\-]+(?:\s+[A-Za-z0-9&.'\-]+){0,6}?)\s+has\s+conducted",
+    re.IGNORECASE,
+)
+
+_SUPPLIER_SUFFIX_RE = re.compile(
+    r"\b(?:spa|s\.p\.a|srl|s\.r\.l|gmbh|ltd|inc|co\.?\s*kg|a\.s\.?|"
+    r"ve\s+tic(?:\.?\s*a\.s\.?)?|ambalaj|sanayi|san\.?|pharma|packaging)\b",
+    re.IGNORECASE,
+)
+
+
+def _supplier_name_tokens(name: str) -> set:
+    """Distinctive tokens from a supplier legal name."""
+    text = (name or "").lower()
+    text = _SUPPLIER_SUFFIX_RE.sub(" ", text)
+    text = re.sub(r"[^a-z0-9]", " ", text)
+    return {w for w in text.split() if len(w) >= 4}
+
+
+def _subject_matches_supplier(subject: str, supplier_name: str) -> bool:
+    subject_tokens = _supplier_name_tokens(subject)
+    supplier_tokens = _supplier_name_tokens(supplier_name)
+    if not subject_tokens or not supplier_tokens:
+        return True
+    for st in subject_tokens:
+        for sp in supplier_tokens:
+            if st == sp or st in sp or sp in st:
+                return True
+    return False
+
+
+_PASS_THROUGH_DECLARATION_RE = re.compile(
+    r"present\s+declaration\s+is\s+valid\s+for\s+material",
+    re.IGNORECASE,
+)
+
+
+def _supplier_named_in_text(text: str, supplier_name: str) -> bool:
+    tokens = _supplier_name_tokens(supplier_name)
+    if not tokens:
+        return False
+    haystack = (text or "").lower()
+    return any(token in haystack for token in tokens)
+
+
+def evidence_declarant_mismatch(
+    evidence: str,
+    supplier_name: str,
+    source_markdown: Optional[str] = None,
+) -> bool:
+    """
+    True when evidence attributes analysis to another company without scoping to the audited supplier.
+
+    Pass-through manufacturer declarations are allowed when the same document names the audited
+    supplier (e.g. Belkofleks header + "Present declaration is valid for material…").
+    """
+    if not evidence or not supplier_name:
+        return False
+    match = _DECLARANT_ACTION_RE.search(evidence)
+    if not match:
+        return False
+    if _subject_matches_supplier(match.group("subject"), supplier_name):
+        return False
+
+    context_parts = [evidence]
+    if source_markdown:
+        context_parts.append(source_markdown[:2500])
+    context = "\n".join(context_parts)
+    if (
+        _supplier_named_in_text(context, supplier_name)
+        and _PASS_THROUGH_DECLARATION_RE.search(context)
+    ):
+        return False
+    return True
+
+
+def enrich_pass_through_pfas_evidence(
+    evidence: str,
+    source_markdown: str,
+    supplier_name: str,
+) -> str:
+    """Build a PFAS quote for manufacturer pass-through declarations scoped to a supplier."""
+    if not source_markdown or not supplier_name:
+        return evidence
+    if not _PASS_THROUGH_DECLARATION_RE.search(source_markdown):
+        return evidence
+    if (
+        evidence
+        and evidence not in ("NONE", "")
+        and evidence_indicates_compliant(CHECK_PFAS, evidence)
+        and _supplier_named_in_text(evidence, supplier_name)
+    ):
+        return evidence
+
+    pfas_match = _PFAS_COMPLIANT_EVIDENCE_RE.search(source_markdown)
+    if not pfas_match:
+        return evidence
+
+    header_match = re.search(
+        rf"({re.escape(supplier_name.split()[0])}[^\n]{{0,120}})",
+        source_markdown,
+        re.IGNORECASE,
+    )
+    if not header_match:
+        tokens = sorted(_supplier_name_tokens(supplier_name), key=len, reverse=True)
+        for token in tokens:
+            header_match = re.search(
+                rf"(\b{re.escape(token)}\b[^\n]{{0,160}})", source_markdown, re.I
+            )
+            if header_match:
+                break
+    if not header_match:
+        return evidence
+
+    pfas_end = min(len(source_markdown), pfas_match.end() + 80)
+    ranked: List[Tuple[int, str]] = []
+
+    for window in range(300, 199, -1):
+        start = pfas_end - window
+        if start < 0:
+            continue
+        candidate = re.sub(r"\s+", " ", source_markdown[start:pfas_end]).strip()
+        if (
+            _PFAS_COMPLIANT_EVIDENCE_RE.search(candidate)
+            and evidence_in_source(candidate, source_markdown)
+        ):
+            score = 0
+            if _supplier_named_in_text(candidate[:140], supplier_name):
+                score += 20
+            if _supplier_named_in_text(candidate, supplier_name):
+                score += 10
+            if _PASS_THROUGH_DECLARATION_RE.search(candidate):
+                score += 8
+            ranked.append((score, candidate))
+
+    if ranked:
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        best_quote = ranked[0][1]
+        if len(best_quote) >= MIN_EVIDENCE_CHARS:
+            return best_quote[:300]
+
+    pfas_start = max(0, pfas_match.start() - 60)
+    fallback = re.sub(r"\s+", " ", source_markdown[pfas_start:pfas_end]).strip()
+    if len(fallback) >= MIN_EVIDENCE_CHARS and evidence_in_source(fallback, source_markdown):
+        return fallback[:300]
+    return evidence
+
+
 def is_regulatory_boilerplate_only(evidence: str) -> bool:
     """True when the quote looks like PPWR/legal text only, not a supplier material statement."""
     if not evidence or evidence.strip().upper() == "NONE":
@@ -455,6 +605,7 @@ def validate_point_finding(
     finding,
     source_markdown: str,
     check: Optional[str] = None,
+    supplier_name: Optional[str] = None,
 ):
     """Downgrade to N/A when evidence is missing, off-topic, not in source, or boilerplate-only."""
     if finding.answer not in ("yes", "no"):
@@ -462,6 +613,14 @@ def validate_point_finding(
     if finding.evidence in ("", "NONE"):
         finding.answer = "N/A"
         finding.concentration = "N/A"
+        return finding
+    if supplier_name and evidence_declarant_mismatch(
+        finding.evidence, supplier_name, source_markdown
+    ):
+        _downgrade_finding(
+            finding,
+            "Evidence describes another company's analysis, not the audited supplier.",
+        )
         return finding
     if check and not evidence_matches_check(finding.evidence, check):
         _downgrade_finding(
@@ -481,6 +640,10 @@ def validate_point_finding(
             "Quote describes legal requirements only, not supplier material.",
         )
         return finding
+    if check == CHECK_PFAS and supplier_name:
+        finding.evidence = enrich_pass_through_pfas_evidence(
+            finding.evidence, source_markdown, supplier_name
+        )
     return correct_inverted_check_finding(finding, check) if check else finding
 
 
