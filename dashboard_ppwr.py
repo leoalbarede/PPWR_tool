@@ -25,7 +25,7 @@ from evidence_validator import (
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RESULT_PATH = os.path.join(BASE_DIR, "ppwr_audit_results.csv")
+RESULT_PATH = os.path.join(BASE_DIR, "data", "ppwr_audit_results.csv")
 IS_STREAMLIT_CLOUD = bool(os.getenv("STREAMLIT_SHARING_MODE") or os.getenv("STREAMLIT_SERVER_HEADLESS"))
 
 CHECK_ORDER = ["Heavy metals", "SoC", "PFAS", "SVHC"]

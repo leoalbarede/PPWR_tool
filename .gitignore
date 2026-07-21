@@ -10,3 +10,7 @@ __pycache__/
 ppwr_audit_run.log
 *.bak-*
 .streamlit/secrets.toml
+
+# Source supplier documents (kept locally, not versioned)
+docs/1st_wave/
+docs/2st_wave/

@@ -1,32 +1,57 @@
-# PPWR tool — RAG core
+# PPWR tool
 
-Reusable document-audit engine extracted from the PlanetCare ESG pipeline.
+Document-audit engine for PPWR supplier compliance: PDF → RAG → binary compliance CSV,
+with a Streamlit dashboard and helper scripts to export results.
 
-## Modules
+## Project structure
 
-| File | Role |
-|------|------|
-| `analyzer_docling.py` | PDF → Markdown (cache), adaptive RAG by doc size (small / medium / large) |
-| `ppwr_audit.py` | Batch PPWR audit: supplier folders → CSV (heavy metals + SoC) |
-| `tiktoken_cache_setup.py` | Persistent local tiktoken cache (corporate proxy / macOS temp) |
-| `flashrank_cache_setup.py` | FlashRank cache (large documents only, >20 chunks) |
+```
+PPWR_tool/
+├── streamlit_app.py            # Streamlit Cloud entry point
+├── dashboard_ppwr.py           # Dashboard UI + compliance resolution (source of truth)
+├── evidence_validator.py       # Evidence checks, answer correction, PFAS/SoC/SVHC logic
+├── analyzer_docling.py         # PDF → Markdown (cache) + adaptive RAG (small/medium/large)
+├── ppwr_audit.py               # Batch audit: supplier folders → results CSV
+├── tiktoken_cache_setup.py     # Persistent tiktoken cache setup
+├── flashrank_cache_setup.py    # FlashRank cache (large documents only)
+│
+├── scripts/                    # One-off / helper tools
+│   ├── fill_results_for_heiko.py   # Fill compliance columns in a Heiko workbook from a CSV
+│   ├── patch_ppwr_csv.py           # Post-hoc corrections to an audit CSV (no LLM re-run)
+│   └── file_manager.py
+│
+├── data/                       # Generated data (versioned)
+│   ├── ppwr_audit_results.csv          # 1st wave audit (read by the dashboard)
+│   ├── ppwr_audit_results_2nd_wave.csv # 2nd wave audit
+│   └── results/                        # Filled Heiko workbooks
+│       ├── 1st_wave_results_for_heiko.xlsx
+│       └── 1st_2nd_wave_results_for_heiko.xlsx
+│
+├── docs/                       # Source supplier PDFs — LOCAL ONLY (git-ignored)
+│   ├── 1st_wave/
+│   └── 2st_wave/
+│
+├── requirements.txt            # Dashboard only (Streamlit Cloud)
+├── requirements-audit.txt      # Full audit pipeline (PDF RAG)
+└── .python-version
+```
 
-Caches are created automatically under `markdown_cache/`, `vector_cache/`, `tiktoken_cache/`, and `flashrank_cache/`.
+Runtime caches (`markdown_cache/`, `vector_cache/`, `tiktoken_cache/`, `flashrank_cache/`) are
+created automatically and are git-ignored. Source PDFs under `docs/` are kept locally and are
+**not** versioned; only the generated CSVs and result workbooks under `data/` are committed.
 
 ## Setup
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+
+# Full audit pipeline (PDF RAG + export)
 pip install -r requirements-audit.txt
-pip install streamlit pandas
-```
+pip install streamlit pandas openpyxl
 
-For **local dashboard only** (no PDF audit):
-
-```bash
+# Dashboard only (no PDF audit)
 pip install -r requirements.txt
-streamlit run streamlit_app.py
 ```
 
 Create a `.env` file:
@@ -39,85 +64,85 @@ TIKTOKEN_CACHE_DIR=./tiktoken_cache
 FLASHRANK_CACHE_DIR=./flashrank_cache
 ```
 
-On first run, tiktoken may download an encoding file unless cached. FlashRank is only loaded for large documents (>20 chunks).
+## PPWR supplier audit
+
+Binary compliance check on regulatory PDFs per supplier folder under `docs/`.
+
+Supplier folders are recognized in two layouts:
+
+- `{Supplier No} - {Supplier name}` (e.g. `S00122_0100114617 - AMCOR FLEXIBLES SELESTAT`)
+- `{numeric id} {Supplier name}` (e.g. `100001453 JOSE GRAELLS E HIJOS S A`)
+
+Folders may be grouped under list folders (e.g. `docs/1st_wave/EU (PPWR list Metal Pack)/...`).
+PDFs are collected recursively, so nested subfolders are supported.
+
+```bash
+# List suppliers and PDF counts for a docs subtree
+python ppwr_audit.py --list-suppliers --docs-dir docs/2st_wave
+
+# Run full audit -> data/ppwr_audit_results.csv
+python ppwr_audit.py --docs-dir docs/1st_wave
+
+# Write to a custom CSV, with separate evidence columns for review
+python ppwr_audit.py --docs-dir docs/2st_wave \
+  --output data/ppwr_audit_results_2nd_wave.csv --with-evidence-columns
+
+# One supplier only (faster test)
+python ppwr_audit.py --docs-dir docs/2st_wave --supplier "JOSE"
+```
 
 ### Adaptive retrieval
 
 | Profile | Chunks | Strategy |
 |---------|--------|----------|
-| `small` | ≤ 6 (~≤5 pp) | BM25 only, no vector index, no rerank |
-| `medium` | 7–20 (~6–15 pp) | BM25 + dense MMR, no rerank |
+| `small` | ≤ 6 | BM25 only, no vector index, no rerank |
+| `medium` | 7–20 | BM25 + dense MMR, no rerank |
 | `large` | > 20 | Full hybrid + multi-query + FlashRank |
 
 Profile is selected automatically; override with `retrieval_profile=` in `ask_pdf_multi_section`.
 
-## PPWR supplier audit
+## Fill a Heiko workbook from an audit CSV
 
-Binary compliance check on regulatory PDFs per CMO supplier folder under `docs/`.
-
-Each subfolder must be named: `{Supplier No} - {Supplier name}` (e.g. `S00122_0100114617 - AMCOR FLEXIBLES SELESTAT`).
-
-Documents can be organized under list folders:
-
-```
-docs/
-  EU (PPWR list Metal Pack)/
-    S00122_0100114617 - AMCOR FLEXIBLES SELESTAT/
-      *.pdf
-  PT (PPWR list) (PrimC (EU)/
-    ...
-```
-
-The CSV and dashboard matrix include a **Doc list** column with the parent folder name.
+`scripts/fill_results_for_heiko.py` writes the compliance columns (heavy metals, PFAS, SoC, SVHC)
+into the master workbook, matched by Supplier ID. Values: `1` = compliant, `0` = non-compliant,
+`no response` = N/A. It edits only the matched cells (surgical XLSX edit) and makes a `.bak` first.
 
 ```bash
-# List suppliers and PDF counts
-python ppwr_audit.py --list-suppliers
+# Defaults: data/ppwr_audit_results.csv -> data/results/1st_2nd_wave_results_for_heiko.xlsx
+python scripts/fill_results_for_heiko.py
 
-# Run full audit → ppwr_audit_results.csv
-python ppwr_audit.py
+# Explicit CSV + target workbook
+python scripts/fill_results_for_heiko.py \
+  --csv data/ppwr_audit_results_2nd_wave.csv \
+  --xlsx data/results/1st_2nd_wave_results_for_heiko.xlsx
 
-# One supplier only (faster test)
-python ppwr_audit.py --supplier "CONSTANTIA"
-
-# Separate evidence columns for manual review
-python ppwr_audit.py --with-evidence-columns
-
-# Dashboard (after audit CSV exists)
-streamlit run streamlit_app.py
+# Self-test (no real data needed)
+python scripts/fill_results_for_heiko.py --self-test
 ```
 
 ## Streamlit Cloud deployment
 
-The hosted app only needs **`streamlit_app.py`**, **`dashboard_ppwr.py`**, **`evidence_validator.py`**, and **`ppwr_audit_results.csv`**. The heavy RAG stack (`requirements-audit.txt`) runs locally.
+The hosted app only needs `streamlit_app.py`, `dashboard_ppwr.py`, `evidence_validator.py`,
+and `data/ppwr_audit_results.csv`. The heavy RAG stack (`requirements-audit.txt`) runs locally.
 
-1. Generate or update results locally:
+1. Generate/update results locally and commit `data/ppwr_audit_results.csv`.
+2. On [share.streamlit.io](https://share.streamlit.io), create an app from `leoalbarede/PPWR_tool`:
+   - Main file: `streamlit_app.py`
+   - Python: see `.python-version`
+   - Requirements: `requirements.txt` (auto-detected)
+3. Redeploy after each CSV update (push to `main`). No secrets are required (read-only CSV).
 
-```bash
-pip install -r requirements-audit.txt
-python ppwr_audit.py --with-evidence-columns
-```
-
-2. Commit and push `ppwr_audit_results.csv` with the code.
-
-3. On [share.streamlit.io](https://share.streamlit.io), create an app from **`leoalbarede/PPWR_tool`**:
-   - **Main file:** `streamlit_app.py`
-   - **Python:** 3.11 (see `.python-version`)
-   - **Requirements:** `requirements.txt` (auto-detected)
-
-4. Redeploy after each CSV update (push to `main`).
-
-No Streamlit secrets are required for the dashboard (read-only CSV).
-
-**CSV columns (default):**
+### Audit CSV columns
 
 | Column | Meaning |
 |--------|---------|
-| Supplier No. | Folder prefix before ` - ` |
-| Doc list | Parent folder under `docs/` (e.g. `EU (PPWR list Metal Pack)`) |
-| Supplier | Supplier name from folder |
-| PPWR compliant with heavy metals concentration limit | `yes` / `no` / `N/A` — sum of Pb, Cd, Hg, Cr6+ &lt; 100 mg |
-| PPWR SoC content | `yes` / `no` / `N/A` — presence of Substances of Concern |
+| Supplier No. | Supplier ID from the folder name |
+| Doc list | Parent list folder (if any) |
+| Supplier | Supplier name from the folder |
+| PPWR compliant with heavy metals concentration limit | `yes` / `no` / `N/A` |
+| PPWR SoC content | `yes` / `no` / `N/A` |
+| PPWR PFAS content | `yes` / `no` / `N/A` (inverted semantics: see `evidence_validator.py`) |
+| PPWR SVHC content | `yes` / `no` / `N/A` |
 | Concentration | Stated values + verbatim quote and source PDF when found |
 
 Answers are grounded in retrieved PDF text only; missing information is reported as `N/A` (no inference).
@@ -131,26 +156,13 @@ from analyzer_docling import ask_pdf_multi_section
 
 load_dotenv()
 
-sections = [
-    (
-        "PPWR — packaging",
-        """
-1. PPWR or Directive 94/62/EC mentioned
-2. Recycled content disclosed
-""".strip(),
-    ),
-]
-
 result = ask_pdf_multi_section(
     pdf_path="/path/to/report.pdf",
     instruction="Answer each numbered line: YES | NO | N/A with Evidence and Location.",
-    sections=sections,
+    sections=[("PPWR — packaging", "1. PPWR mentioned\n2. Recycled content disclosed")],
     api_key=os.getenv("OPENAI_API_KEY"),
     k=5,
 )
-
 print(result["retrieval_profile"], result["n_index_chunks"])
 print(result["answer"])
 ```
-
-Add your own checklist, output parser, and UI on top of this core.

@@ -31,7 +31,7 @@ from evidence_validator import (
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(BASE_DIR, "docs")
-DEFAULT_OUTPUT = os.path.join(BASE_DIR, "ppwr_audit_results.csv")
+DEFAULT_OUTPUT = os.path.join(BASE_DIR, "data", "ppwr_audit_results.csv")
 
 SUPPLIER_FOLDER_RE = re.compile(r"^(?P<supplier_no>.+?)\s*-\s*(?P<supplier>.+)$")
 # Fallback for "<numeric id> <name>" folders (e.g. "100001453 JOSE GRAELLS E HIJOS S A").
