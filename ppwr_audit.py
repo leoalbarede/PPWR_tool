@@ -34,6 +34,8 @@ DOCS_DIR = os.path.join(BASE_DIR, "docs")
 DEFAULT_OUTPUT = os.path.join(BASE_DIR, "ppwr_audit_results.csv")
 
 SUPPLIER_FOLDER_RE = re.compile(r"^(?P<supplier_no>.+?)\s*-\s*(?P<supplier>.+)$")
+# Fallback for "<numeric id> <name>" folders (e.g. "100001453 JOSE GRAELLS E HIJOS S A").
+SUPPLIER_FOLDER_SPACE_RE = re.compile(r"^(?P<supplier_no>\d+)\s+(?P<supplier>.+)$")
 
 PPWR_INSTRUCTION = """
 You are a PPWR regulatory document auditor. Answer ONLY from the CONTEXT passages below.
@@ -192,19 +194,27 @@ def _extract_supplier_no(raw_prefix: str) -> str:
 
 
 def parse_supplier_folder(folder_name: str) -> Optional[Tuple[str, str]]:
-    match = SUPPLIER_FOLDER_RE.match(folder_name.strip())
-    if not match:
-        return None
-    supplier_no = _extract_supplier_no(match.group("supplier_no"))
-    return supplier_no, match.group("supplier").strip()
+    name = folder_name.strip()
+    match = SUPPLIER_FOLDER_RE.match(name)
+    if match:
+        supplier_no = _extract_supplier_no(match.group("supplier_no"))
+        return supplier_no, match.group("supplier").strip()
+    # Fallback: "<numeric id> <name>" layout (no " - " separator).
+    space_match = SUPPLIER_FOLDER_SPACE_RE.match(name)
+    if space_match:
+        supplier_no = _extract_supplier_no(space_match.group("supplier_no"))
+        return supplier_no, space_match.group("supplier").strip()
+    return None
 
 
 def _collect_pdfs(folder_path: str) -> List[str]:
-    return sorted(
-        os.path.join(folder_path, f)
-        for f in os.listdir(folder_path)
-        if f.lower().endswith(".pdf")
-    )
+    """All PDFs under a supplier folder, recursively (handles nested subfolders)."""
+    result: List[str] = []
+    for root, _dirs, files in os.walk(folder_path):
+        for f in files:
+            if f.lower().endswith(".pdf"):
+                result.append(os.path.join(root, f))
+    return sorted(result)
 
 
 def discover_suppliers(

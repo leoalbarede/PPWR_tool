@@ -15,8 +15,12 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.document_compressors import FlashrankRerank
-from langchain_classic.chains.question_answering import load_qa_chain
-from langchain_classic.retrievers.ensemble import EnsembleRetriever
+try:  # langchain >= 1.0 moved legacy chains/retrievers to langchain_classic
+    from langchain_classic.chains.question_answering import load_qa_chain
+    from langchain_classic.retrievers.ensemble import EnsembleRetriever
+except ModuleNotFoundError:  # langchain 0.3.x
+    from langchain.chains.question_answering import load_qa_chain
+    from langchain.retrievers import EnsembleRetriever
 from langchain_core.documents import Document
 
 from langfuse import observe

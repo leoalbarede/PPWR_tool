@@ -8,4 +8,5 @@ __pycache__/
 *.pyc
 *.log
 ppwr_audit_run.log
+*.bak-*
 .streamlit/secrets.toml
